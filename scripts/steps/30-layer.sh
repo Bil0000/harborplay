@@ -16,6 +16,8 @@ ST=$(mktemp -d)
 trap 'rm -rf "$ST"' EXIT
 
 cp -a /src/guest/layer/usr "$ST/usr"
+# Local test runs leave Python caches (with the build machine's paths) in the source tree.
+find "$ST/usr" -name __pycache__ -prune -exec rm -rf {} +
 install -d "$ST/usr/lib/harborplay/fex-eac"
 for file in build-fex.sh install-fex-tool.sh; do
     install -m 0755 "/src/fex-eac/$file" "$ST/usr/lib/harborplay/fex-eac/$file"

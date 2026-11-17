@@ -144,6 +144,8 @@ mkdir -p "$WORK"
 APP="$WORK/$NAME.app"
 ditto "$SRC" "$APP"
 /usr/libexec/PlistBuddy -c 'Delete :HarborPlayBuildOut' "$APP/Contents/Info.plist" 2>/dev/null || true
+# Debug map entries name build machine paths; the dSYMs (same UUIDs) keep the symbols.
+strip -S "$APP/Contents/MacOS/"* "$APP/Contents/Frameworks/"*.dylib
 # Official builds report crash events as environment "release" only when this key names the team
 # whose Developer ID signed the running code (CrashReporting.buildKind); everything else, including
 # --no-notarize test builds, reports "source-build".

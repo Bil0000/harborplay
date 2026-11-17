@@ -127,6 +127,8 @@ done
 	# which ld and dyld reject for images built against the macOS 27 SDK ("mis-aligned LINKEDIT
 	# string pool"; rust-lang/rust#157750, fixed in LLVM by llvm/llvm-project#203680).
 	export CARGO_PROFILE_RELEASE_STRIP=false
+	# No build machine paths (home folder, checkout) in the shipped library.
+	export CARGO_BUILD_RUSTFLAGS="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=cargo --remap-path-prefix=$src=libkrun --remap-path-prefix=${RUSTUP_HOME:-$HOME/.rustup}=rustup"
 	# shellcheck disable=SC2086
 	make $MAKE_FLAGS
 	make PREFIX="$out" libkrun.pc

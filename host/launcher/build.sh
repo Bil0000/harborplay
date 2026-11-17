@@ -66,6 +66,9 @@ SWIFT_FLAGS=(
     -Xlinker -rpath -Xlinker "$KRUN_PREFIX/lib"
     -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$PLIST"
     -Xswiftc -emit-localized-strings -Xswiftc -emit-localized-strings-path -Xswiftc "$HERE/.build/stringsdata"
+    # No build machine paths (home folder, checkout) in the shipped binary.
+    -Xswiftc -file-prefix-map -Xswiftc "$HERE=launcher"
+    -Xcc "-ffile-prefix-map=$HERE=launcher"
 )
 
 "$HERE/fetch-zstd.sh"

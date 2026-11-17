@@ -1069,7 +1069,7 @@ enum CrashReporting {
         func shaderFixture(bytes: Int) -> String {
             var lines = Array(repeating: "// shader attachment padding", count: 1137)
             lines[568] = "kernel void sentryAttachmentMiddle() {}"
-            lines[0] = "// /Users/harborplay-attachment-test/private/shader.metal"
+            lines[0] = "// " + NSHomeDirectory() + "/private/shader.metal"
             let padding = bytes - lines.reduce(0) { $0 + $1.utf8.count + 1 }
             let each = padding / lines.count, extra = padding % lines.count
             for index in lines.indices { lines[index] += String(repeating: "x", count: each + (index < extra ? 1 : 0)) }
