@@ -143,7 +143,7 @@ index 64f9a74..00e9657 100644
          worker.stop();
          assert_eq!(seen.lock().unwrap()[0], "start");
 diff --git a/src/devices/src/virtio/snd/audio_backends/coreaudio.rs b/src/devices/src/virtio/snd/audio_backends/coreaudio.rs
-index aaac406..a940782 100644
+index aaac406..e9cd23e 100644
 --- a/src/devices/src/virtio/snd/audio_backends/coreaudio.rs
 +++ b/src/devices/src/virtio/snd/audio_backends/coreaudio.rs
 @@ -18,8 +18,9 @@
@@ -158,7 +158,7 @@ index aaac406..a940782 100644
  //
  // Underruns: after START, and again after the ring ran dry, the callback plays silence until
  // the ring holds a FIFO's worth (or a FIFO's time has passed), then plays on; each gap followed
-@@ -2533,10 +2534,72 @@ impl Inner {
+@@ -2533,10 +2534,76 @@ impl Inner {
      }
  }
  
@@ -166,12 +166,12 @@ index aaac406..a940782 100644
 +const CAPTURE_INPUT_GAP: Duration = Duration::from_millis(100);
 +
 +/// Pump state of a capture stream without input: when the ring last grew, and since when the
-+/// guest gets silence and how much of it.
++/// guest gets silence in which format and how much of it.
 +#[derive(Default)]
 +struct SilentCapture {
 +    written: u64,
 +    input_at: Option<Instant>,
-+    since: Option<(Instant, u64)>,
++    since: Option<(Instant, u64, Format)>,
 +}
 +
 +/// Capture without input (no microphone, permission denied, a start stuck in HAL that holds
@@ -195,7 +195,11 @@ index aaac406..a940782 100644
 +    let guest = &mut streams[id];
 +    let fmt = Format::from_params(&guest.params)?;
 +    let fb = fmt.frame_bytes() as u128;
-+    let (start, sent) = state.since.get_or_insert((now, 0));
++    // A restart in another format between two passes starts the count again.
++    if state.since.is_some_and(|(_, _, f)| f != fmt) {
++        state.since = None;
++    }
++    let (start, sent, _) = state.since.get_or_insert((now, 0, fmt));
 +    let due = ((now - *start).as_nanos() * fmt.rate as u128 / 1_000_000_000 * fb) as u64;
 +    if guest.buffers.is_empty() {
 +        // The guest is not reading: owe it nothing for that time.
@@ -231,7 +235,7 @@ index aaac406..a940782 100644
      while !inner.quit.load(Ordering::Acquire) {
          inner.wake.wait(timeout);
          timeout = HOUSEKEEPING;
-@@ -2554,6 +2617,16 @@ fn pump_thread(inner: Arc<Inner>) {
+@@ -2554,6 +2621,16 @@ fn pump_thread(inner: Arc<Inner>) {
                  timeout = timeout.min(due);
              }
          }
@@ -248,7 +252,7 @@ index aaac406..a940782 100644
          if last.elapsed() >= HOUSEKEEPING {
              last = Instant::now();
              for (id, lock) in inner.hosts.iter().enumerate() {
-@@ -2650,7 +2723,8 @@ impl CoreAudioBackend {
+@@ -2650,7 +2727,8 @@ impl CoreAudioBackend {
                          result.map_err(|err| err.to_string())
                      }
                      Operation::Stop => {
@@ -258,7 +262,7 @@ index aaac406..a940782 100644
                          host.stop_unit();
                          host.shared.ring.clear();
                          Ok(())
-@@ -2984,7 +3058,12 @@ impl CoreAudioBackend {
+@@ -2984,7 +3062,12 @@ impl CoreAudioBackend {
              let fmt = Format::from_params(&self.inner.streams.read().unwrap()[id].params)
                  .ok_or(Error::UnexpectedAudioBackendConfiguration)?;
              self.inner.shared[id].running.store(false, Ordering::Release);
@@ -272,7 +276,7 @@ index aaac406..a940782 100644
              self.inner.shared[id].running.store(true, Ordering::Release);
              self.inner.wake.signal();
              return Ok(());
-@@ -3118,7 +3197,7 @@ impl AudioBackend for CoreAudioBackend {
+@@ -3118,7 +3201,7 @@ impl AudioBackend for CoreAudioBackend {
  mod tests {
      use std::sync::atomic::AtomicU32;
  
@@ -281,18 +285,15 @@ index aaac406..a940782 100644
  
      use super::*;
      use crate::legacy::DummyIrqChip;
-@@ -3414,6 +3493,54 @@ mod tests {
+@@ -3414,6 +3497,89 @@ mod tests {
          assert_eq!(message.status.load(Ordering::SeqCst), VIRTIO_SND_S_IO_ERR);
      }
  
-+    /// Capture reads complete with silence while no input arrives, also while a start stuck in
-+    /// HAL holds the stream past the watchdog's limit. (Before: they stayed queued until the
-+    /// watchdog failed them with IO_ERR, the guest's read returned EIO, and PipeWire stopped.)
-+    #[test]
-+    fn capture_without_input_completes_reads_with_silence() {
++    /// A backend with a started capture stream 0 at `rate`.
++    fn capture_backend(rate: u8) -> Arc<CoreAudioBackend> {
 +        let mut stream = Stream::default();
 +        stream.direction = Direction::Input;
-+        stream.params.rate = VIRTIO_SND_PCM_RATE_48000;
++        stream.params.rate = rate;
 +        stream.params.channels = 2;
 +        stream.state = PCMState::Start;
 +        let streams = Arc::new(RwLock::new(vec![stream]));
@@ -301,10 +302,16 @@ index aaac406..a940782 100644
 +                .unwrap(),
 +        );
 +        backend.inner.shared[0].running.store(true, Ordering::Release);
-+        let _stuck = StuckPump::new(&backend);
-+        std::thread::sleep(STALL * 2);
++        backend
++    }
++
++    /// Queues a capture read of `len` bytes over 0xaa at guest address 0x400.
++    fn queue_capture_read(
++        backend: &CoreAudioBackend,
++        len: u32,
++    ) -> (Arc<IOMessage>, GuestMemoryMmap<()>) {
 +        let mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
-+        mem.write_slice(&[0xaa; 1920], GuestAddress(0x400)).unwrap();
++        mem.write_slice(&vec![0xaa; len as usize], GuestAddress(0x400)).unwrap();
 +        let interrupt =
 +            InterruptTransport::new(DummyIrqChip::new().into(), "snd-test".into()).unwrap();
 +        let message = Arc::new(IOMessage {
@@ -315,11 +322,23 @@ index aaac406..a940782 100644
 +            response_descriptor: Descriptor { addr: 0x100, len: 8, flags: 0, next: 0 },
 +            vring: Arc::new(Mutex::new(Vring { mem: mem.clone(), queue: Queue::new(16), interrupt })),
 +        });
-+        // 5 ms of 48 kHz stereo S16.
-+        let desc = Descriptor { addr: 0x400, len: 1920, flags: 0, next: 0 };
++        let desc = Descriptor { addr: 0x400, len, flags: 0, next: 0 };
 +        backend.inner.streams.write().unwrap()[0]
 +            .buffers
 +            .push_back(Buffer::new(desc, message.clone(), Direction::Input));
++        (message, mem)
++    }
++
++    /// Capture reads complete with silence while no input arrives, also while a start stuck in
++    /// HAL holds the stream past the watchdog's limit. (Before: they stayed queued until the
++    /// watchdog failed them with IO_ERR, the guest's read returned EIO, and PipeWire stopped.)
++    #[test]
++    fn capture_without_input_completes_reads_with_silence() {
++        let backend = capture_backend(VIRTIO_SND_PCM_RATE_48000);
++        let _stuck = StuckPump::new(&backend);
++        std::thread::sleep(STALL * 2);
++        // 5 ms of 48 kHz stereo S16.
++        let (message, mem) = queue_capture_read(&backend, 1920);
 +        let start = Instant::now();
 +        backend.read(0).unwrap();
 +        wait_for("silence to complete the read", Duration::from_secs(1), || {
@@ -331,6 +350,26 @@ index aaac406..a940782 100644
 +        let mut data = [0xaau8; 1920];
 +        mem.read_slice(&mut data, GuestAddress(0x400)).unwrap();
 +        assert!(data.iter().all(|&b| b == 0));
++    }
++
++    /// A restart at a lower rate between two pump passes paces silence at the new rate. (Before:
++    /// the count of a minute at 48 kHz held back reads at 16 kHz for two minutes.)
++    #[test]
++    fn capture_silence_follows_a_format_change() {
++        let backend = capture_backend(VIRTIO_SND_PCM_RATE_16000);
++        // Only this test fills silence: stop the pump and the watchdog.
++        backend.inner.quit.store(true, Ordering::Release);
++        backend.inner.wake.signal();
++        std::thread::sleep(Duration::from_millis(50));
++        let old = Format { format: VIRTIO_SND_PCM_FMT_S16, rate: 48000, channels: 2 };
++        let minute = Instant::now() - Duration::from_secs(60);
++        let mut state = SilentCapture { since: Some((minute, 60 * 48000 * 4, old)), ..Default::default() };
++        // 30 ms of 16 kHz stereo S16.
++        let (message, _mem) = queue_capture_read(&backend, 1920);
++        wait_for("silence to complete the read", Duration::from_secs(1), || {
++            fill_silent_capture(&backend.inner, 0, &mut state);
++            completed(&message)
++        });
 +    }
 +
      /// An idle but healthy pump (it only wakes every HOUSEKEEPING) is not mistaken for a stuck
