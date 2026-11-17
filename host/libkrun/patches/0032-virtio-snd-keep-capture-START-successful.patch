@@ -1,0 +1,377 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Tue, 17 Nov 2026 15:30:00 +0300
+Subject: [PATCH] virtio-snd: keep capture START successful when the microphone
+ is slow or missing
+
+A game that opens voice chat starts the capture stream. When the Mac input
+device took longer than 200 ms to start, PCM_START failed with IO_ERR and the
+late start was canceled. PipeWire retried snd_pcm_start in a tight loop at
+real-time priority, the guest killed it with SIGKILL, and the game lost all
+sound for the rest of the session.
+
+Let a slow start finish in the background and answer START with OK. A start
+that fails (no input device, permission denied) is logged. While no input
+arrives, including while a start stuck in HAL holds the stream, the pump
+completes the guest's reads with silence at the stream's rate: a read that
+never completes fails in the guest with EIO, and the watchdog would fail it
+with IO_ERR. Real input takes over once the device delivers. Playback is not
+affected. The start command queue no longer refuses a request while another
+one is pending.
+---
+diff --git a/src/devices/src/virtio/snd/audio_backends/capture.rs b/src/devices/src/virtio/snd/audio_backends/capture.rs
+index 64f9a74..00e9657 100644
+--- a/src/devices/src/virtio/snd/audio_backends/capture.rs
++++ b/src/devices/src/virtio/snd/audio_backends/capture.rs
+@@ -18,9 +18,8 @@ enum Command<P> {
+ }
+ 
+ pub(super) struct CaptureWorker<P> {
+-    tx: mpsc::SyncSender<Command<P>>,
++    tx: mpsc::Sender<Command<P>>,
+     generation: Arc<AtomicU64>,
+-    pending: Arc<AtomicBool>,
+     quit: Arc<AtomicBool>,
+ }
+ 
+@@ -28,11 +27,10 @@ impl<P: Send + 'static> CaptureWorker<P> {
+     pub(super) fn new(
+         mut handle: impl FnMut(Operation<P>) -> Result<(), String> + Send + 'static,
+     ) -> std::io::Result<Self> {
+-        let (tx, rx) = mpsc::sync_channel(1);
++        let (tx, rx) = mpsc::channel();
+         let generation = Arc::new(AtomicU64::new(0));
+-        let pending = Arc::new(AtomicBool::new(false));
+         let quit = Arc::new(AtomicBool::new(false));
+-        let (epoch, busy, done) = (generation.clone(), pending.clone(), quit.clone());
++        let (epoch, done) = (generation.clone(), quit.clone());
+         // Do not join on drop: a system audio API can be waiting for a permission dialog.
+         // The worker owns its audio resources until that call returns, then stops them.
+         std::thread::Builder::new()
+@@ -46,14 +44,11 @@ impl<P: Send + 'static> CaptureWorker<P> {
+                             } else {
+                                 Err("capture start canceled".into())
+                             };
+-                            let failed = result.is_err();
+-                            if epoch.load(Ordering::Acquire) != requested
+-                                || reply.send(result).is_err()
+-                                || failed
+-                            {
++                            if epoch.load(Ordering::Acquire) != requested || result.is_err() {
+                                 let _ = handle(Operation::Stop);
+                             }
+-                            busy.store(false, Ordering::Release);
++                            // The caller may have stopped waiting; a late start keeps running.
++                            let _ = reply.try_send(result);
+                         }
+                         Ok(Command::Stop) => { let _ = handle(Operation::Stop); }
+                         Err(mpsc::RecvTimeoutError::Timeout) => { let _ = handle(Operation::Poll); }
+@@ -62,32 +57,28 @@ impl<P: Send + 'static> CaptureWorker<P> {
+                 }
+                 let _ = handle(Operation::Stop);
+             })?;
+-        Ok(Self { tx, generation, pending, quit })
++        Ok(Self { tx, generation, quit })
+     }
+ 
++    /// Start capture. A device or permission prompt that takes longer than START_TIMEOUT keeps
++    /// starting in the background and the call succeeds: the stream has no data until the
++    /// device runs. Failing START instead makes the guest sound server retry in a tight loop.
+     pub(super) fn start(&self, params: P) -> Result<(), String> {
+-        if self.pending.swap(true, Ordering::AcqRel) {
+-            return Err("capture device is still starting/stopping".into());
+-        }
+-        let (tx, rx) = mpsc::sync_channel(0);
++        let (tx, rx) = mpsc::sync_channel(1);
+         let epoch = self.generation.load(Ordering::Acquire);
+-        if self.tx.try_send(Command::Start(params, epoch, tx)).is_err() {
+-            self.pending.store(false, Ordering::Release);
+-            return Err("capture worker is busy".into());
+-        }
++        self.tx
++            .send(Command::Start(params, epoch, tx))
++            .map_err(|_| "capture worker is gone".to_string())?;
+         match rx.recv_timeout(START_TIMEOUT) {
+             Ok(result) => result,
+-            Err(_) => {
+-                self.stop();
+-                Err("capture start exceeded 200 ms (microphone permission/device); request failed, late start canceled".into())
+-            }
++            Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
++            Err(mpsc::RecvTimeoutError::Disconnected) => Err("capture worker is gone".into()),
+         }
+     }
+ 
+     pub(super) fn stop(&self) {
+         self.generation.fetch_add(1, Ordering::AcqRel);
+-        // A full queue contains either Stop or a Start canceled by the generation above.
+-        let _ = self.tx.try_send(Command::Stop);
++        let _ = self.tx.send(Command::Stop);
+     }
+ }
+ 
+@@ -105,7 +96,7 @@ mod tests {
+     use std::time::Instant;
+ 
+     #[test]
+-    fn blocked_start_times_out_and_late_start_is_stopped() {
++    fn blocked_start_succeeds_and_late_start_is_stopped() {
+         let (entered_tx, entered_rx) = mpsc::channel();
+         let (unblock_tx, unblock_rx) = mpsc::channel();
+         let (stopped_tx, stopped_rx) = mpsc::channel();
+@@ -121,12 +112,11 @@ mod tests {
+             Ok(())
+         }).unwrap();
+         let before = Instant::now();
+-        assert!(worker.start(()).unwrap_err().contains("exceeded 200 ms"));
++        assert!(worker.start(()).is_ok());
+         assert!(before.elapsed() < Duration::from_secs(1));
+         entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+         let before = Instant::now();
+         worker.stop();
+-        assert!(worker.start(()).is_err());
+         assert!(before.elapsed() < Duration::from_millis(100));
+         unblock_tx.send(()).unwrap();
+         stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+@@ -148,8 +138,6 @@ mod tests {
+             Ok(())
+         }).unwrap();
+         assert!(worker.start(false).is_ok());
+-        // Pending is cleared after the rendezvous; wait for the worker's next dispatch.
+-        while worker.pending.load(Ordering::Acquire) { std::thread::yield_now(); }
+         assert_eq!(worker.start(true).unwrap_err(), "no input device");
+         worker.stop();
+         assert_eq!(seen.lock().unwrap()[0], "start");
+diff --git a/src/devices/src/virtio/snd/audio_backends/coreaudio.rs b/src/devices/src/virtio/snd/audio_backends/coreaudio.rs
+index aaac406..e9cd23e 100644
+--- a/src/devices/src/virtio/snd/audio_backends/coreaudio.rs
++++ b/src/devices/src/virtio/snd/audio_backends/coreaudio.rs
+@@ -18,8 +18,9 @@
+ //
+ // Capture: a HAL input unit renders Float32 into a ring; the pump converts it into guest
+ // buffers. Device setup/start/stop and TCC interaction run on a separate capture worker.
+-// START waits at most 200 ms, returning IO_ERR if the device/permission is still pending.
+-// A timed-out start is canceled; PREPARE/RELEASE return queued buffers even if HAL is stuck.
++// START waits at most 200 ms and always succeeds: a slow device or permission prompt keeps
++// starting in the background, and a missing microphone leaves the stream without data.
++// PREPARE/RELEASE return queued buffers even if HAL is stuck.
+ //
+ // Underruns: after START, and again after the ring ran dry, the callback plays silence until
+ // the ring holds a FIFO's worth (or a FIFO's time has passed), then plays on; each gap followed
+@@ -2533,10 +2534,76 @@ impl Inner {
+     }
+ }
+ 
++/// Capture input that stopped this long ago counts as missing.
++const CAPTURE_INPUT_GAP: Duration = Duration::from_millis(100);
++
++/// Pump state of a capture stream without input: when the ring last grew, and since when the
++/// guest gets silence in which format and how much of it.
++#[derive(Default)]
++struct SilentCapture {
++    written: u64,
++    input_at: Option<Instant>,
++    since: Option<(Instant, u64, Format)>,
++}
++
++/// Capture without input (no microphone, permission denied, a start stuck in HAL that holds
++/// the stream): complete the guest's reads with silence at the stream's rate, without the
++/// stream's lock. A read that never completes fails in the guest with EIO, and its sound
++/// server then stops. Real input takes over once the device delivers. Returns when to come back.
++fn fill_silent_capture(inner: &Inner, id: usize, state: &mut SilentCapture) -> Option<Duration> {
++    let shared = &inner.shared[id];
++    let now = Instant::now();
++    let written = shared.ring.written();
++    if written != state.written {
++        state.written = written;
++        state.input_at = Some(now);
++    }
++    let live = state.input_at.is_some_and(|at| now - at < CAPTURE_INPUT_GAP);
++    if live || !shared.running.load(Ordering::Acquire) {
++        state.since = None;
++        return None;
++    }
++    let mut streams = inner.streams.write().unwrap();
++    let guest = &mut streams[id];
++    let fmt = Format::from_params(&guest.params)?;
++    let fb = fmt.frame_bytes() as u128;
++    // A restart in another format between two passes starts the count again.
++    if state.since.is_some_and(|(_, _, f)| f != fmt) {
++        state.since = None;
++    }
++    let (start, sent, _) = state.since.get_or_insert((now, 0, fmt));
++    let due = ((now - *start).as_nanos() * fmt.rate as u128 / 1_000_000_000 * fb) as u64;
++    if guest.buffers.is_empty() {
++        // The guest is not reading: owe it nothing for that time.
++        *sent = due;
++    }
++    let silence = [fmt.silence(); 4096];
++    while *sent < due {
++        let Some(buf) = guest.buffers.front_mut() else { break };
++        let space = (buf.desc_len() as usize).saturating_sub(buf.pos);
++        let n = space.min((due - *sent) as usize).min(silence.len());
++        if n > 0 {
++            match buf.write_input(&silence[..n]) {
++                Ok(len) => *sent += len as u64,
++                Err(_) => {
++                    buf.message.status.store(VIRTIO_SND_S_IO_ERR, Ordering::SeqCst);
++                    buf.pos = buf.desc_len() as usize;
++                }
++            }
++        }
++        if buf.pos >= buf.desc_len() as usize {
++            let buf = guest.buffers.pop_front().unwrap();
++            buf.message.latency_bytes.store(0, Ordering::Relaxed);
++        }
++    }
++    Some(Duration::from_millis(5))
++}
++
+ fn pump_thread(inner: Arc<Inner>) {
+     utils::macos::set_thread_qos_user_interactive();
+     let mut last = Instant::now();
+     let mut timeout = HOUSEKEEPING;
++    let mut silent: Vec<SilentCapture> = inner.hosts.iter().map(|_| Default::default()).collect();
+     while !inner.quit.load(Ordering::Acquire) {
+         inner.wake.wait(timeout);
+         timeout = HOUSEKEEPING;
+@@ -2554,6 +2621,16 @@ fn pump_thread(inner: Arc<Inner>) {
+                 timeout = timeout.min(due);
+             }
+         }
++        for (id, state) in silent.iter_mut().enumerate() {
++            if inner.capture[id].is_none() {
++                continue;
++            }
++            // Capture reads complete here even while the capture worker holds the stream.
++            inner.beat(id);
++            if let Some(due) = fill_silent_capture(&inner, id, state) {
++                timeout = timeout.min(due);
++            }
++        }
+         if last.elapsed() >= HOUSEKEEPING {
+             last = Instant::now();
+             for (id, lock) in inner.hosts.iter().enumerate() {
+@@ -2650,7 +2727,8 @@ impl CoreAudioBackend {
+                         result.map_err(|err| err.to_string())
+                     }
+                     Operation::Stop => {
+-                        host.shared.running.store(false, Ordering::Release);
++                        // `running` belongs to the control requests: a Stop queued behind a
++                        // slow start must not clear it after the next START set it.
+                         host.stop_unit();
+                         host.shared.ring.clear();
+                         Ok(())
+@@ -2984,7 +3062,12 @@ impl CoreAudioBackend {
+             let fmt = Format::from_params(&self.inner.streams.read().unwrap()[id].params)
+                 .ok_or(Error::UnexpectedAudioBackendConfiguration)?;
+             self.inner.shared[id].running.store(false, Ordering::Release);
+-            capture.start(fmt).map_err(Error::UnexpectedAudioBackendError)?;
++            // A failed START makes the guest sound server retry at once and in a loop, until
++            // the guest kills it and all game sound stops. Without a microphone the capture
++            // stream only has no data.
++            if let Err(err) = capture.start(fmt) {
++                log::error!("snd: stream {stream_id}: capture start failed, the stream has no data: {err}");
++            }
+             self.inner.shared[id].running.store(true, Ordering::Release);
+             self.inner.wake.signal();
+             return Ok(());
+@@ -3118,7 +3201,7 @@ impl AudioBackend for CoreAudioBackend {
+ mod tests {
+     use std::sync::atomic::AtomicU32;
+ 
+-    use vm_memory::{GuestAddress, GuestMemoryMmap};
++    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+ 
+     use super::*;
+     use crate::legacy::DummyIrqChip;
+@@ -3414,6 +3497,89 @@ mod tests {
+         assert_eq!(message.status.load(Ordering::SeqCst), VIRTIO_SND_S_IO_ERR);
+     }
+ 
++    /// A backend with a started capture stream 0 at `rate`.
++    fn capture_backend(rate: u8) -> Arc<CoreAudioBackend> {
++        let mut stream = Stream::default();
++        stream.direction = Direction::Input;
++        stream.params.rate = rate;
++        stream.params.channels = 2;
++        stream.state = PCMState::Start;
++        let streams = Arc::new(RwLock::new(vec![stream]));
++        let backend = Arc::new(
++            CoreAudioBackend::with_deadlines(streams, Arc::new(SndControl::default()), CTL, STALL)
++                .unwrap(),
++        );
++        backend.inner.shared[0].running.store(true, Ordering::Release);
++        backend
++    }
++
++    /// Queues a capture read of `len` bytes over 0xaa at guest address 0x400.
++    fn queue_capture_read(
++        backend: &CoreAudioBackend,
++        len: u32,
++    ) -> (Arc<IOMessage>, GuestMemoryMmap<()>) {
++        let mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
++        mem.write_slice(&vec![0xaa; len as usize], GuestAddress(0x400)).unwrap();
++        let interrupt =
++            InterruptTransport::new(DummyIrqChip::new().into(), "snd-test".into()).unwrap();
++        let message = Arc::new(IOMessage {
++            status: AtomicU32::new(VIRTIO_SND_S_OK),
++            used_len: 0.into(),
++            latency_bytes: 0.into(),
++            head_index: 0,
++            response_descriptor: Descriptor { addr: 0x100, len: 8, flags: 0, next: 0 },
++            vring: Arc::new(Mutex::new(Vring { mem: mem.clone(), queue: Queue::new(16), interrupt })),
++        });
++        let desc = Descriptor { addr: 0x400, len, flags: 0, next: 0 };
++        backend.inner.streams.write().unwrap()[0]
++            .buffers
++            .push_back(Buffer::new(desc, message.clone(), Direction::Input));
++        (message, mem)
++    }
++
++    /// Capture reads complete with silence while no input arrives, also while a start stuck in
++    /// HAL holds the stream past the watchdog's limit. (Before: they stayed queued until the
++    /// watchdog failed them with IO_ERR, the guest's read returned EIO, and PipeWire stopped.)
++    #[test]
++    fn capture_without_input_completes_reads_with_silence() {
++        let backend = capture_backend(VIRTIO_SND_PCM_RATE_48000);
++        let _stuck = StuckPump::new(&backend);
++        std::thread::sleep(STALL * 2);
++        // 5 ms of 48 kHz stereo S16.
++        let (message, mem) = queue_capture_read(&backend, 1920);
++        let start = Instant::now();
++        backend.read(0).unwrap();
++        wait_for("silence to complete the read", Duration::from_secs(1), || {
++            completed(&message)
++        });
++        assert!(start.elapsed() >= Duration::from_millis(4), "silence is paced");
++        assert_eq!(message.status.load(Ordering::SeqCst), VIRTIO_SND_S_OK);
++        assert_eq!(message.used_len.load(Ordering::SeqCst), 1920);
++        let mut data = [0xaau8; 1920];
++        mem.read_slice(&mut data, GuestAddress(0x400)).unwrap();
++        assert!(data.iter().all(|&b| b == 0));
++    }
++
++    /// A restart at a lower rate between two pump passes paces silence at the new rate. (Before:
++    /// the count of a minute at 48 kHz held back reads at 16 kHz for two minutes.)
++    #[test]
++    fn capture_silence_follows_a_format_change() {
++        let backend = capture_backend(VIRTIO_SND_PCM_RATE_16000);
++        // Only this test fills silence: stop the pump and the watchdog.
++        backend.inner.quit.store(true, Ordering::Release);
++        backend.inner.wake.signal();
++        std::thread::sleep(Duration::from_millis(50));
++        let old = Format { format: VIRTIO_SND_PCM_FMT_S16, rate: 48000, channels: 2 };
++        let minute = Instant::now() - Duration::from_secs(60);
++        let mut state = SilentCapture { since: Some((minute, 60 * 48000 * 4, old)), ..Default::default() };
++        // 30 ms of 16 kHz stereo S16.
++        let (message, _mem) = queue_capture_read(&backend, 1920);
++        wait_for("silence to complete the read", Duration::from_secs(1), || {
++            fill_silent_capture(&backend.inner, 0, &mut state);
++            completed(&message)
++        });
++    }
++
+     /// An idle but healthy pump (it only wakes every HOUSEKEEPING) is not mistaken for a stuck
+     /// one.
+     #[test]
