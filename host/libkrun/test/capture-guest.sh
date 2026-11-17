@@ -2,7 +2,7 @@
 # Run INSIDE a fresh throwaway SteamOS VM with virtio-snd enabled.
 # First free hw:0,0: systemctl --user stop wireplumber pipewire-pulse pipewire
 # A working microphone records 3 s. An unavailable, denied or stuck host input
-# gives no data, never an error: an error on START makes PipeWire retry until it
+# records 3 s of silence, never an error: an error makes PipeWire retry until it
 # is killed. The control and I/O queues and playback must still work.
 set -euo pipefail
 scratch=$(mktemp -d)
@@ -16,11 +16,11 @@ for attempt in 1 2 3; do
     if ((rc == 0)); then
         # 3 seconds of 48 kHz, stereo S16 plus the WAV header.
         (( $(stat -c %s "$scratch/capture.wav") >= 576044 ))
-    elif ((rc != 124)); then
+    else
         echo "FAIL: capture exited $rc (START or a read must not fail)" >&2
         exit 1
     fi
-    ((SECONDS - before <= 7))
+    ((SECONDS - before <= 5))
     echo "capture $attempt: completed (status $rc)"
 done
 timeout -k 2 5 aplay -D hw:0,0 -t raw -f S16_LE -r 48000 -c 2 -d 1 /dev/zero

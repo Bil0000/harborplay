@@ -33,8 +33,8 @@
 # Patch 0024 isolates microphone/TCC work from playback and virtio's control queue.
 # STOP never waits for HAL, RELEASE returns queued buffers.
 # Patch 0032 answers capture START with OK after at most 200 ms: a slow input device
-# keeps starting in the background, and a failed one only leaves the capture stream
-# without data. IO_ERR made PipeWire retry until it was killed, and games lost sound.
+# keeps starting in the background. Reads get paced silence while no input arrives.
+# IO_ERR made PipeWire retry until it was killed, and games lost sound.
 # test/capture-guest.sh checks repeated capture and surviving playback inside a fresh
 # throwaway VM.
 # Patch 0025 bumps imago to 0.2.6 (libkrun/libkrun#980, the open 1.19.8 cherry-picks).
@@ -141,7 +141,7 @@ done
 	# Speaker detection/config consistency, PCM permutations, height routing and downmix.
 	RUSTFLAGS="-L native=$out/lib -C link-args=-Wl,-rpath,$out/lib" \
 		cargo test -q --features snd --test macos_audio
-	# Blocked capture setup must time out; late starts stop, and errors complete promptly.
+	# Blocked capture setup answers in time; late starts stop, and errors complete promptly.
 	RUSTFLAGS="-L native=$out/lib -C link-args=-Wl,-rpath,$out/lib" \
 		cargo test -q --features snd --test macos_capture
 	# CoreAudio backend: playback control requests and the pump stalling each other (patch 0027).
