@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Tue, 17 Nov 2026 15:30:00 +0300
+Subject: [PATCH] virtio-snd: keep capture START successful when the microphone
+ is slow or missing
+
+A game that opens voice chat starts the capture stream. When the Mac input
+device took longer than 200 ms to start, PCM_START failed with IO_ERR and the
+late start was canceled. PipeWire retried snd_pcm_start in a tight loop at
+real-time priority, the guest killed it with SIGKILL, and the game lost all
+sound for the rest of the session.
+
+Let a slow start finish in the background and answer START with OK. A start
+that fails (no input device, permission denied) is logged and the capture
+stream has no data; playback is not affected. The start command queue no
+longer refuses a request while another one is pending.
+---
+diff --git a/src/devices/src/virtio/snd/audio_backends/capture.rs b/src/devices/src/virtio/snd/audio_backends/capture.rs
+index 64f9a74..00e9657 100644
+--- a/src/devices/src/virtio/snd/audio_backends/capture.rs
++++ b/src/devices/src/virtio/snd/audio_backends/capture.rs
+@@ -18,9 +18,8 @@ enum Command<P> {
+ }
+ 
+ pub(super) struct CaptureWorker<P> {
+-    tx: mpsc::SyncSender<Command<P>>,
++    tx: mpsc::Sender<Command<P>>,
+     generation: Arc<AtomicU64>,
+-    pending: Arc<AtomicBool>,
+     quit: Arc<AtomicBool>,
+ }
+ 
+@@ -28,11 +27,10 @@ impl<P: Send + 'static> CaptureWorker<P> {
+     pub(super) fn new(
+         mut handle: impl FnMut(Operation<P>) -> Result<(), String> + Send + 'static,
+     ) -> std::io::Result<Self> {
+-        let (tx, rx) = mpsc::sync_channel(1);
++        let (tx, rx) = mpsc::channel();
+         let generation = Arc::new(AtomicU64::new(0));
+-        let pending = Arc::new(AtomicBool::new(false));
+         let quit = Arc::new(AtomicBool::new(false));
+-        let (epoch, busy, done) = (generation.clone(), pending.clone(), quit.clone());
++        let (epoch, done) = (generation.clone(), quit.clone());
+         // Do not join on drop: a system audio API can be waiting for a permission dialog.
+         // The worker owns its audio resources until that call returns, then stops them.
+         std::thread::Builder::new()
+@@ -46,14 +44,11 @@ impl<P: Send + 'static> CaptureWorker<P> {
+                             } else {
+                                 Err("capture start canceled".into())
+                             };
+-                            let failed = result.is_err();
+-                            if epoch.load(Ordering::Acquire) != requested
+-                                || reply.send(result).is_err()
+-                                || failed
+-                            {
++                            if epoch.load(Ordering::Acquire) != requested || result.is_err() {
+                                 let _ = handle(Operation::Stop);
+                             }
+-                            busy.store(false, Ordering::Release);
++                            // The caller may have stopped waiting; a late start keeps running.
++                            let _ = reply.try_send(result);
+                         }
+                         Ok(Command::Stop) => { let _ = handle(Operation::Stop); }
+                         Err(mpsc::RecvTimeoutError::Timeout) => { let _ = handle(Operation::Poll); }
+@@ -62,32 +57,28 @@ impl<P: Send + 'static> CaptureWorker<P> {
+                 }
+                 let _ = handle(Operation::Stop);
+             })?;
+-        Ok(Self { tx, generation, pending, quit })
++        Ok(Self { tx, generation, quit })
+     }
+ 
++    /// Start capture. A device or permission prompt that takes longer than START_TIMEOUT keeps
++    /// starting in the background and the call succeeds: the stream has no data until the
++    /// device runs. Failing START instead makes the guest sound server retry in a tight loop.
+     pub(super) fn start(&self, params: P) -> Result<(), String> {
+-        if self.pending.swap(true, Ordering::AcqRel) {
+-            return Err("capture device is still starting/stopping".into());
+-        }
+-        let (tx, rx) = mpsc::sync_channel(0);
++        let (tx, rx) = mpsc::sync_channel(1);
+         let epoch = self.generation.load(Ordering::Acquire);
+-        if self.tx.try_send(Command::Start(params, epoch, tx)).is_err() {
+-            self.pending.store(false, Ordering::Release);
+-            return Err("capture worker is busy".into());
+-        }
++        self.tx
++            .send(Command::Start(params, epoch, tx))
++            .map_err(|_| "capture worker is gone".to_string())?;
+         match rx.recv_timeout(START_TIMEOUT) {
+             Ok(result) => result,
+-            Err(_) => {
+-                self.stop();
+-                Err("capture start exceeded 200 ms (microphone permission/device); request failed, late start canceled".into())
+-            }
++            Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
++            Err(mpsc::RecvTimeoutError::Disconnected) => Err("capture worker is gone".into()),
+         }
+     }
+ 
+     pub(super) fn stop(&self) {
+         self.generation.fetch_add(1, Ordering::AcqRel);
+-        // A full queue contains either Stop or a Start canceled by the generation above.
+-        let _ = self.tx.try_send(Command::Stop);
++        let _ = self.tx.send(Command::Stop);
+     }
+ }
+ 
+@@ -105,7 +96,7 @@ mod tests {
+     use std::time::Instant;
+ 
+     #[test]
+-    fn blocked_start_times_out_and_late_start_is_stopped() {
++    fn blocked_start_succeeds_and_late_start_is_stopped() {
+         let (entered_tx, entered_rx) = mpsc::channel();
+         let (unblock_tx, unblock_rx) = mpsc::channel();
+         let (stopped_tx, stopped_rx) = mpsc::channel();
+@@ -121,12 +112,11 @@ mod tests {
+             Ok(())
+         }).unwrap();
+         let before = Instant::now();
+-        assert!(worker.start(()).unwrap_err().contains("exceeded 200 ms"));
++        assert!(worker.start(()).is_ok());
+         assert!(before.elapsed() < Duration::from_secs(1));
+         entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+         let before = Instant::now();
+         worker.stop();
+-        assert!(worker.start(()).is_err());
+         assert!(before.elapsed() < Duration::from_millis(100));
+         unblock_tx.send(()).unwrap();
+         stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+@@ -148,8 +138,6 @@ mod tests {
+             Ok(())
+         }).unwrap();
+         assert!(worker.start(false).is_ok());
+-        // Pending is cleared after the rendezvous; wait for the worker's next dispatch.
+-        while worker.pending.load(Ordering::Acquire) { std::thread::yield_now(); }
+         assert_eq!(worker.start(true).unwrap_err(), "no input device");
+         worker.stop();
+         assert_eq!(seen.lock().unwrap()[0], "start");
+diff --git a/src/devices/src/virtio/snd/audio_backends/coreaudio.rs b/src/devices/src/virtio/snd/audio_backends/coreaudio.rs
+index aaac406..7c3362b 100644
+--- a/src/devices/src/virtio/snd/audio_backends/coreaudio.rs
++++ b/src/devices/src/virtio/snd/audio_backends/coreaudio.rs
+@@ -18,8 +18,9 @@
+ //
+ // Capture: a HAL input unit renders Float32 into a ring; the pump converts it into guest
+ // buffers. Device setup/start/stop and TCC interaction run on a separate capture worker.
+-// START waits at most 200 ms, returning IO_ERR if the device/permission is still pending.
+-// A timed-out start is canceled; PREPARE/RELEASE return queued buffers even if HAL is stuck.
++// START waits at most 200 ms and always succeeds: a slow device or permission prompt keeps
++// starting in the background, and a missing microphone leaves the stream without data.
++// PREPARE/RELEASE return queued buffers even if HAL is stuck.
+ //
+ // Underruns: after START, and again after the ring ran dry, the callback plays silence until
+ // the ring holds a FIFO's worth (or a FIFO's time has passed), then plays on; each gap followed
+@@ -2650,7 +2651,8 @@ impl CoreAudioBackend {
+                         result.map_err(|err| err.to_string())
+                     }
+                     Operation::Stop => {
+-                        host.shared.running.store(false, Ordering::Release);
++                        // `running` belongs to the control requests: a Stop queued behind a
++                        // slow start must not clear it after the next START set it.
+                         host.stop_unit();
+                         host.shared.ring.clear();
+                         Ok(())
+@@ -2984,7 +2986,12 @@ impl CoreAudioBackend {
+             let fmt = Format::from_params(&self.inner.streams.read().unwrap()[id].params)
+                 .ok_or(Error::UnexpectedAudioBackendConfiguration)?;
+             self.inner.shared[id].running.store(false, Ordering::Release);
+-            capture.start(fmt).map_err(Error::UnexpectedAudioBackendError)?;
++            // A failed START makes the guest sound server retry at once and in a loop, until
++            // the guest kills it and all game sound stops. Without a microphone the capture
++            // stream only has no data.
++            if let Err(err) = capture.start(fmt) {
++                log::error!("snd: stream {stream_id}: capture start failed, the stream has no data: {err}");
++            }
+             self.inner.shared[id].running.store(true, Ordering::Release);
+             self.inner.wake.signal();
+             return Ok(());

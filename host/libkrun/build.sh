@@ -31,10 +31,12 @@
 # Patch 0023 exposes a non-realtime guest playback tap for Moonlight, before host
 # volume/mute and physical speaker mapping; unregister waits for pending delivery.
 # Patch 0024 isolates microphone/TCC work from playback and virtio's control queue.
-# Capture START has a 200 ms deadline and returns IO_ERR on device/permission failure;
-# late starts are canceled, STOP never waits for HAL, RELEASE returns queued buffers.
-# test/capture-guest.sh checks repeated capture failure/recovery and surviving playback
-# inside a fresh throwaway VM; unavailable input is an ordinary logged audio error.
+# STOP never waits for HAL, RELEASE returns queued buffers.
+# Patch 0032 answers capture START with OK after at most 200 ms: a slow input device
+# keeps starting in the background, and a failed one only leaves the capture stream
+# without data. IO_ERR made PipeWire retry until it was killed, and games lost sound.
+# test/capture-guest.sh checks repeated capture and surviving playback inside a fresh
+# throwaway VM.
 # Patch 0025 bumps imago to 0.2.6 (libkrun/libkrun#980, the open 1.19.8 cherry-picks).
 # imago 0.2.3 shrinks a raw image when a discard or write-zeroes reaches its last
 # byte (libkrun/libkrun#949). steamos.img keeps the backup GPT after home, so this
