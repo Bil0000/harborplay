@@ -1,0 +1,11 @@
+# harborplay: move the steamac data folders in the home to their new names before the user session
+# (see /usr/lib/harborplay/rename-home). A no-op once done.
+[Unit]
+Description=HarborPlay: move old data folders to their new names
+After=home.mount steamos-create-homedir.service
+Before=systemd-user-sessions.service
+RequiresMountsFor=/home
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/harborplay/rename-home /home/steamos

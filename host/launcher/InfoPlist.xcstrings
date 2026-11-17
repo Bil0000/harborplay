@@ -1,0 +1,54 @@
+{
+  "sourceLanguage" : "en",
+  "version" : "1.0",
+  "strings" : {
+    "NSMicrophoneUsageDescription" : {
+      "comment" : "Microphone permission prompt",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The SteamOS virtual machine records from the microphone while a game or Steam voice chat in it uses one."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Виртуальная машина SteamOS записывает звук с микрофона, когда он нужен игре или голосовому чату Steam внутри неё."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SteamOS 虚拟机在其中的游戏或 Steam 语音聊天使用麦克风时进行录音。"
+          }
+        }
+      }
+    },
+    "NSLocalNetworkUsageDescription" : {
+      "comment" : "Local network permission prompt",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connect Moonlight devices to this Mac when Streaming is enabled, and discover and connect Steam Link and Remote Play devices to SteamOS when LAN Remote Play is enabled."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Подключать устройства Moonlight к этому Mac, когда включена трансляция, а также находить и подключать устройства Steam Link и Remote Play к SteamOS, когда включён Remote Play по локальной сети."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用串流时将 Moonlight 设备连接到此 Mac，并在启用局域网 Remote Play 时发现 Steam Link 和 Remote Play 设备并将其连接到 SteamOS。"
+          }
+        }
+      }
+    }
+  }
+}

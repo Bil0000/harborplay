@@ -1,0 +1,18 @@
+# harborplay: reclaim sparse steamos.img space on the Mac. The session's
+# harbor-progress-agent writes ~/.local/share/harborplay/compact-request; harbor-compact-disk.path
+# starts this oneshot as root to fstrim /home (and /var when mounted). virtio-blk
+# DISCARD then punches holes in the host image (see README "Reclaim space on the Mac").
+[Unit]
+Description=HarborPlay reclaim sparse disk space
+ConditionPathExists=/home/steamos/.local/share/harborplay/compact-request
+
+[Service]
+Type=oneshot
+# Bound a stuck FITRIM below the agent's 15-minute response timeout.
+TimeoutStartSec=14min
+ExecStart=/usr/lib/harborplay/compact-disk
+Nice=19
+IOSchedulingClass=idle
+# FITRIM needs the block device behind /home; keep hardening light.
+PrivateTmp=yes
+PrivateNetwork=yes

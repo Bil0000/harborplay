@@ -1,0 +1,5 @@
+#!/bin/sh
+# harborplay Desktop Mode (PATH of /usr/lib/harborplay/nested-desktop): startplasma-wayland
+# starts KWin through kwin_wayland_wrapper; KWin's X11 window takes the display size.
+exec /usr/bin/kwin_wayland_wrapper --width "${HARBORPLAY_DESKTOP_WIDTH:-1280}" \
+    --height "${HARBORPLAY_DESKTOP_HEIGHT:-800}" --no-lockscreen "$@"

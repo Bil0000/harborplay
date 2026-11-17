@@ -1,0 +1,5 @@
+# harborplay: the launcher's virtio-console port "harbor.clipboard" (the clipboard
+# shared with the Mac) is opened by the session user's harbor-clipboard-agent.service.
+# Only that user (steamos) may open it. The /dev/virtio-ports/harbor.clipboard
+# symlink comes from systemd's stock 50-udev-default.rules.
+SUBSYSTEM=="virtio-ports", ATTR{name}=="harbor.clipboard", OWNER="steamos", GROUP="steamos", MODE="0660"

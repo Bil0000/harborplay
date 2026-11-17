@@ -1,0 +1,27 @@
+#!/bin/bash
+set -euo pipefail
+[[ $# -gt 1 && $1 =~ ^[0-9]+$ ]] && shift
+[[ $# -gt 0 ]] || { echo 'usage: eac-launch COMMAND [ARGS...]' >&2; exit 64; }
+steam=$HOME/.local/share/Steam
+prefix=${STEAM_COMPAT_DATA_PATH:-}
+enabled=0
+cmdline=$(cat "${HARBORPLAY_CMDLINE:-/proc/cmdline}")
+read -ra args <<< "$cmdline"
+for arg in "${args[@]}"; do
+    case "$arg" in harborplay.fex_eac=*) enabled=${arg#*=} ;; esac
+done
+if [[ $enabled == 1 ]]; then
+    name='Proton EasyAntiCheat Runtime'
+    runtime="${prefix%/compatdata/*}/common/$name"
+    [[ $prefix == */compatdata/* && -d $runtime ]] || runtime="$steam/steamapps/common/$name"
+    if [[ -n ${PROTON_EAC_RUNTIME:-} ]]; then
+        :
+    elif [[ -d $runtime ]]; then
+        export PROTON_EAC_RUNTIME=$runtime
+    else
+        echo "eac-launch: Install $name in Steam first." >&2
+    fi
+    [[ -n $prefix ]] && export EAC_LAUNCHERDIR="${EAC_LAUNCHERDIR:-$prefix/pfx/drive_c/users/steamuser/AppData/Roaming/EasyAntiCheat}"
+    export PROTON_USE_XALIA="${PROTON_USE_XALIA:-0}"
+fi
+exec "$@"

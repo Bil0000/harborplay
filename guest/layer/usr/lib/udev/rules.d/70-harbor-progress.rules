@@ -1,0 +1,20 @@
+# harborplay: the launcher's virtio-console port "harbor.progress" (guest -> host
+# progress messages for the HarborPlay overlay) must be writable by
+# the session user's harbor-progress-agent (and nobody else). The /dev/virtio-ports/harbor.progress symlink
+# itself comes from systemd's stock 50-udev-default.rules.
+SUBSYSTEM=="virtio-ports", ATTR{name}=="harbor.progress", OWNER="steamos", GROUP="steamos", MODE="0660"
+# harborplay: the launcher's port "harbor.clock" (host -> guest wall-clock time after
+# a resume from suspend) is read by the root service harbor-clock-sync.service;
+# the device node keeps the default root-only mode.
+SUBSYSTEM=="virtio-ports", ATTR{name}=="harbor.clock", TAG+="systemd", ENV{SYSTEMD_WANTS}+="harbor-clock-sync.service"
+# harborplay: the launcher's port "harbor.pad" (the Mac's controller -> the guest's
+# uinput gamepad, its rumble back) is served by the root service harbor-pad.service;
+# the device node keeps the default root-only mode.
+SUBSYSTEM=="virtio-ports", ATTR{name}=="harbor.pad", TAG+="systemd", ENV{SYSTEMD_WANTS}+="harbor-pad.service"
+# harborplay: the launcher's ports "harbor.pad2", "harbor.pad3", ... (further controllers:
+# players 2 and up, one port and one pad each) are served by an instance of
+# harbor-pad@.service named after the port.
+SUBSYSTEM=="virtio-ports", ATTR{name}=="harbor.pad[2-9]", TAG+="systemd", ENV{SYSTEMD_WANTS}+="harbor-pad@$attr{name}.service"
+# The port "harbor.sleep" (guest sleep -> the launcher pauses the VM) needs no rule:
+# only root's systemd-suspend.service opens it (harbor-progress-agent sleep), and
+# the default root-only mode is right.

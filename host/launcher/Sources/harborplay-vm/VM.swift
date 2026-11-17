@@ -1,0 +1,286 @@
+import CKrun
+import Darwin
+import Foundation
+import Metal
+
+struct KrunError: Error, CustomStringConvertible {
+    let call: String
+    let code: Int32
+    var description: String { "\(call) failed: \(code) (\(String(cString: strerror(-code))))" }
+}
+
+@discardableResult
+func krun(_ name: String, _ r: Int32) throws -> Int32 {
+    if r < 0 { throw KrunError(call: name, code: r) }
+    return r
+}
+
+/// Input devices handed to the window (nil in headless mode). The gamepads are not among them: the
+/// guest creates them over harbor.pad, harbor.pad2, … (PadPort, GamepadBridge).
+struct VMInputs {
+    let keyboard: InputDevice
+    let tablet: InputDevice
+    let mouse: InputDevice
+}
+
+/// libkrun context: configuration (boot contract) and the VMM thread.
+final class VM {
+    let ctx: UInt32
+    private(set) var shutdownFd: Int32 = -1
+    private(set) var running = false
+    /// This boot has a virtio-snd device (runtime controls: SoundControl).
+    private(set) var hasSound = false
+    private let displayId: UInt32
+    /// Boot EDID; its mm-per-pixel is reused for every resize (constant DPI).
+    let edid: EdidSize.Result
+    private var displaySize: (Int, Int, Int, Int)   // px w, h, mm w, h
+    private var refreshRate: Int
+    /// Largest guest display side libkrun's EDID detailed timing can describe.
+    static let maxDisplaySide = 4095
+
+    /// A macOS guest can expose a paravirtual Metal GPU but no usable nested Hypervisor API
+    /// (STEAMAC-15: IpaGetMaximum failed before the first guest instruction).
+    struct HostEnvironment {
+        var vmmPresent: Int?
+        var hypervisorSupported: Int?
+        var model: String?
+        var gpu: String?
+
+        static var current: HostEnvironment {
+            HostEnvironment(vmmPresent: integer("kern.hv_vmm_present"),
+                            hypervisorSupported: integer("kern.hv_support"),
+                            model: ReportBundle.sysctl("hw.model"),
+                            gpu: MTLCreateSystemDefaultDevice()?.name)
+        }
+
+        private static func integer(_ name: String) -> Int? {
+            var value: Int32 = 0
+            var size = MemoryLayout<Int32>.size
+            guard sysctlbyname(name, &value, &size, nil, 0) == 0 else { return nil }
+            return Int(value)
+        }
+
+        var isVirtualMachine: Bool {
+            vmmPresent == 1 || model?.lowercased().hasPrefix("virtualmac") == true
+                || gpu?.localizedCaseInsensitiveContains("paravirtual") == true
+        }
+
+        var rejection: String? {
+            if isVirtualMachine {
+                return String(localized: "HarborPlay cannot start SteamOS inside a macOS virtual machine. Nested virtualization is not supported. Run the launcher directly on your Mac, not inside a virtual machine.")
+            }
+            if hypervisorSupported == 0 {
+                return String(localized: "Hardware virtualization is unavailable on this system. HarborPlay needs the macOS Hypervisor framework to start SteamOS. Run the launcher directly on a supported Mac.")
+            }
+            // Older macOS versions may omit a sysctl; absence alone is not a refusal.
+            return nil
+        }
+
+        var diagnostic: String {
+            "kern.hv_vmm_present=\(vmmPresent.map(String.init) ?? "?"), kern.hv_support=\(hypervisorSupported.map(String.init) ?? "?"), hw.model=\(model ?? "?"), GPU=\(gpu ?? "?")"
+        }
+    }
+
+    init(options o: Options, display: DisplayBackend, console: Console, progressPort: ProgressPort?,
+         clockPort: ClockPort?, sleepPort: SleepPort?, padPorts: [PadPort], clipboardPort: ClipboardPort?,
+         inputs: VMInputs?, netSocket: String?) throws {
+        VM.raiseFileLimit()
+        try krun("krun_init_log", krun_init_log(KRUN_LOG_TARGET_DEFAULT, o.krunLogLevel, UInt32(KRUN_LOG_STYLE_AUTO), 0))
+        ctx = UInt32(try krun("krun_create_ctx", krun_create_ctx()))
+        try krun("krun_set_vm_config", krun_set_vm_config(ctx, UInt8(o.cpus), UInt32(o.memMiB)))
+
+        // No TSI/vsock in this guest; hvc0 = our pty (explicit console instead of the implicit
+        // stdio one, so console output also works when stdout is a pipe/file).
+        try krun("krun_disable_implicit_vsock", krun_disable_implicit_vsock(ctx))
+        try krun("krun_disable_implicit_console", krun_disable_implicit_console(ctx))
+        let con = try krun("krun_add_virtio_console_multiport", krun_add_virtio_console_multiport(ctx))
+        try krun("krun_add_console_port_tty", krun_add_console_port_tty(ctx, UInt32(con), "", console.slaveFd))
+        // Guest -> host boot/shutdown progress (FX overlay): guest writes /dev/virtio-ports/harbor.progress.
+        if let p = progressPort {
+            try krun("krun_add_console_port_inout(\(ProgressPort.name))",
+                     krun_add_console_port_inout(ctx, UInt32(con), ProgressPort.name, p.guestInputFd, p.guestOutputFd))
+        }
+        // Host -> guest wall-clock time after a resume from suspend (harbor-clock-sync.service).
+        if let c = clockPort {
+            try krun("krun_add_console_port_inout(\(ClockPort.name))",
+                     krun_add_console_port_inout(ctx, UInt32(con), ClockPort.name, c.guestInputFd, c.guestOutputFd))
+        }
+        // Guest sleep requests (systemd-suspend.service) -> the launcher pauses the VM, and wakes.
+        if let s = sleepPort {
+            try krun("krun_add_console_port_inout(\(SleepPort.name))",
+                     krun_add_console_port_inout(ctx, UInt32(con), SleepPort.name, s.guestInputFd, s.guestOutputFd))
+        }
+        // The Mac's controllers -> the guest's uinput gamepads (harbor-pad.service, harbor-pad@.service: one
+        // port per player), their rumble back.
+        for p in padPorts {
+            try krun("krun_add_console_port_inout(\(p.name))",
+                     krun_add_console_port_inout(ctx, UInt32(con), p.name, p.guestInputFd, p.guestOutputFd))
+        }
+        // The Mac's clipboard <-> SteamOS's (harbor-clipboard-agent.service, ClipboardSync).
+        if let c = clipboardPort {
+            try krun("krun_add_console_port_inout(\(ClipboardPort.name))",
+                     krun_add_console_port_inout(ctx, UInt32(con), ClipboardPort.name, c.guestInputFd, c.guestOutputFd))
+        }
+
+        try krun("krun_set_kernel", krun_set_kernel(ctx, o.kernel, HARBORPLAY_KERNEL_FORMAT_RAW, o.initrd, o.cmdline))
+
+        for (i, d) in o.disks.enumerated() {
+            let id = "vd" + String(UnicodeScalar(UInt8(97 + i)))
+            if !d.readOnly { try DiskLock.hold(d.path) }
+            try krun("krun_add_disk2(\(d.path))", krun_add_disk2(ctx, id, d.path, HARBORPLAY_DISK_FORMAT_RAW, d.readOnly))
+            log("disk \(id): \(d.path)\(d.readOnly ? " (ro)" : "")")
+        }
+
+        // Shared Mac folder → virtio-fs "macshare" (guest: mount -t virtiofs macshare DIR). Simplified
+        // semantics: the guest sees its own uid/gid on every file instead of the Mac's, so the
+        // steamos user reads and writes the folder without ownership mapping; no DAX window.
+        if let share = o.share {
+            try krun("krun_add_virtiofs4(\(share))",
+                     krun_add_virtiofs4(ctx, Options.shareTag, share, 0, false, UInt32(KRUN_SEMANTICS_LINUX_SIMPLIFIED)))
+            log("share: \(share) → virtio-fs tag \(Options.shareTag)")
+        }
+
+        // virtio-snd → CoreAudio default output (and default input while the guest records).
+        if o.sound {
+            if krun_has_feature(UInt64(KRUN_FEATURE_SND)) == 1 {
+                try krun("krun_set_snd_device", krun_set_snd_device(ctx, true))
+                hasSound = true
+            } else {
+                log("warning: this libkrun was built without SND=1; no guest audio")
+            }
+        }
+
+        // GPU: Venus only (no virgl GL), host-visible shm window for blobs. virglrenderer (in this
+        // process) opens the Vulkan driver named by VKR_VULKAN_DRIVER (its patch 0013).
+        Self.applyGraphicsEnv(o)
+        setenv("VKR_VULKAN_DRIVER", "@rpath/" + o.vulkanDriver.library, 1)
+        setenv("VKR_GPU_BUDGET_MIB", String(o.gpuBudgetMiB), 1)
+        OverlayView.vulkanDriver = o.vulkanDriver
+        OverlayView.dxmt = o.wmtrLibrary != nil
+        log("gpu: Venus → \(o.vulkanDriver.name), \(o.gpuBudgetMiB) MiB advertised memory budget")
+        let flags = o.gpuFlags ?? (HARBORPLAY_VIRGL_VENUS | HARBORPLAY_VIRGL_NO_VIRGL)
+        log("gpu: virgl flags \(String(format: "0x%08x", flags)) (\(o.gpuFlags == nil ? "default" : "command-line override"))")
+        try krun("krun_set_gpu_options2", krun_set_gpu_options2(ctx, flags, UInt64(o.shmMiB) << 20))
+        let (gw, gh) = o.guestSize
+        displayId = UInt32(try krun("krun_add_display", krun_add_display(ctx, UInt32(gw), UInt32(gh))))
+        let did = displayId
+        try krun("krun_display_set_refresh_rate", krun_display_set_refresh_rate(ctx, did, UInt32(o.refreshRate)))
+        refreshRate = o.refreshRate
+        // EDID physical size (drives the guest UI scale; libkrun's default of 300 DPI makes Steam ~2x).
+        edid = EdidSize.resolve(o)
+        try krun("krun_display_set_physical_size",
+                 krun_display_set_physical_size(ctx, did, UInt16(clamping: edid.widthMM), UInt16(clamping: edid.heightMM)))
+        displaySize = (gw, gh, edid.widthMM, edid.heightMM)
+        log("display: \(gw)x\(gh) px" + (o.pixelScale > 1 ? " (window \(o.displayWidth)x\(o.displayHeight) pt, Retina \(o.pixelScale)x)" : "")
+            + " → \(edid.widthMM)x\(edid.heightMM) mm (\(edid.source)); follows the window size at this DPI")
+        var backend = display.makeCBackend()
+        try krun("krun_set_display_backend", krun_set_display_backend(ctx, &backend, MemoryLayout<krun_display_backend>.size))
+
+        if let inputs {
+            guard krun_has_feature(UInt64(KRUN_FEATURE_INPUT)) == 1 else {
+                throw OptionError("this libkrun was built without INPUT=1 (krun_has_feature(KRUN_FEATURE_INPUT) != 1); use --headless or the libkrun from work/out/host/lib")
+            }
+            try inputs.keyboard.attach(ctx: ctx)
+            try inputs.tablet.attach(ctx: ctx)
+            try inputs.mouse.attach(ctx: ctx)
+        }
+
+        if let netSocket { try Gvproxy.attach(ctx: ctx, socket: netSocket) }
+
+        // macOS/aarch64: an eventfd wired to libkrun's gpio-keys device (graceful shutdown key).
+        shutdownFd = krun_get_shutdown_eventfd(ctx)
+        if shutdownFd < 0 { log("warning: krun_get_shutdown_eventfd: \(shutdownFd)"); shutdownFd = -1 }
+    }
+
+    /// Experimental wmtr context type (libkrun 0018): libkrun reads these when it builds the GPU.
+    /// The setting (or --wmtr-lib / --no-wmtr) decides, not an inherited environment; the game's
+    /// CAMetalLayer goes on top of the VM view (WMTR_PRESENT=overlay).
+    static func applyGraphicsEnv(_ o: Options) {
+        if let lib = o.wmtrLibrary {
+            setenv("HARBORPLAY_WMTR", "1", 1)
+            setenv("HARBORPLAY_WMTR_LIB", lib, 1)
+            setenv("WMTR_PRESENT", "overlay", 1)
+            log("gpu: wmtr context type offered (experimental), executor \(lib)")
+        } else {
+            for k in ["HARBORPLAY_WMTR", "HARBORPLAY_WMTR_LIB", "WMTR_PRESENT"] { unsetenv(k) }
+        }
+    }
+
+    /// A Finder launch starts with a soft RLIMIT_NOFILE of 256. virglrenderer runs in this process
+    /// (render server and workers are threads) and every host-visible guest allocation is a POSIX
+    /// shm: about four descriptors per mapped allocation (the memory's shm, the blob, the blob's
+    /// resource, libkrun's export). A game past a few dozen of them ran out: the blob export failed
+    /// ("proxy: invalid reply for blob"), then shm_open in vkAllocateMemory, and the guest's Venus
+    /// context died at the memory's first use (STEAMAC-G). The soft limit goes to the most the
+    /// kernel allows a process (kern.maxfilesperproc, at most the hard limit).
+    static func raiseFileLimit() {
+        var rl = rlimit()
+        var perProc: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        guard getrlimit(RLIMIT_NOFILE, &rl) == 0,
+              sysctlbyname("kern.maxfilesperproc", &perProc, &size, nil, 0) == 0, perProc > 0 else {
+            log("warning: RLIMIT_NOFILE / kern.maxfilesperproc unreadable: \(String(cString: strerror(errno)))")
+            return
+        }
+        let want = min(rl.rlim_max, rlim_t(perProc))
+        guard rl.rlim_cur < want else { return }
+        let was = rl.rlim_cur
+        rl.rlim_cur = want
+        if setrlimit(RLIMIT_NOFILE, &rl) == 0 {
+            log("file descriptors: soft limit \(was) → \(want)")
+        } else {
+            log("warning: setrlimit(RLIMIT_NOFILE, \(want)): \(String(cString: strerror(errno))); soft limit stays \(was)")
+        }
+    }
+
+    /// Runs the VMM on a dedicated thread. libkrun exit()s the process when the guest stops.
+    func start() {
+        running = true
+        VMMemoryDiagnostics.shared.start()
+        let t = Thread { [ctx] in
+            let r = krun_start_enter(ctx)
+            fatal("krun_start_enter failed: \(r) (\(String(cString: strerror(-r))))")
+        }
+        t.name = "krun-vmm"
+        t.stackSize = 16 << 20
+        t.qualityOfService = .userInteractive
+        t.start()
+    }
+
+    /// Ask the guest to switch its display to `width`x`height` px at the boot DPI (any thread;
+    /// libkrun regenerates the EDID and sends a display-change notification). No-op if unchanged.
+    func resizeDisplay(width: Int, height: Int) {
+        let (wmm, hmm) = edid.millimetres(width, height)
+        guard (width, height, wmm, hmm) != displaySize else { return }
+        let r = krun_display_resize(ctx, displayId, UInt32(width), UInt32(height), UInt16(clamping: wmm), UInt16(clamping: hmm))
+        if r < 0 {
+            log("display: resize to \(width)x\(height) failed: \(r) (\(String(cString: strerror(-r))))")
+            return
+        }
+        displaySize = (width, height, wmm, hmm)
+        log("display: resized to \(width)x\(height) px (\(wmm)×\(hmm) mm, same DPI)")
+    }
+
+    /// Give the guest display a new refresh rate at its current size (main thread; the guest sees
+    /// a mode change like a resize). No-op if unchanged.
+    func setRefreshRate(_ hz: Int) {
+        guard hz != refreshRate else { return }
+        let (w, h, wmm, hmm) = displaySize
+        let r = krun_display_set_mode(ctx, displayId, UInt32(w), UInt32(h), UInt16(clamping: wmm), UInt16(clamping: hmm), UInt32(hz))
+        if r < 0 {
+            log("display: refresh rate \(hz) Hz failed: \(r) (\(String(cString: strerror(-r))))")
+            return
+        }
+        log("display: refresh rate \(refreshRate) -> \(hz) Hz")
+        refreshRate = hz
+    }
+
+    /// Press the guest power key (gpio-keys, KEY_RESTART in libkrun 1.19.6's FDT; systemd-logind
+    /// shuts down and libkrun exits on PSCI SYSTEM_OFF/RESET). Returns false if unavailable.
+    @discardableResult
+    func requestShutdown() -> Bool {
+        guard shutdownFd >= 0 else { return false }
+        var one: UInt64 = 1
+        return Darwin.write(shutdownFd, &one, 8) == 8
+    }
+}

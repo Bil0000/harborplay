@@ -1,0 +1,20 @@
+#!/bin/sh
+# harborplay: once per home, before the user session: the old steamac data folders move to their new
+# names with one rename each, and the old names stay as symlinks so an older layer still finds them.
+# Steam launch options keep /usr/lib/steamac/eac-launch, which the layer's compatibility symlink serves.
+home=${1:-/home/steamos}
+[ -d "$home" ] || exit 0
+for dir in .config .local/state .local/share; do
+    old=$home/$dir/steamac new=$home/$dir/harborplay
+    [ -d "$old" ] && [ ! -L "$old" ] && [ ! -e "$new" ] || continue
+    if mv "$old" "$new" && ln -s harborplay "$old"; then
+        chown -h "$(stat -c %u:%g "$new")" "$old"
+        echo "rename-home: moved $old to $new"
+    else
+        echo "rename-home: cannot move $old to $new" >&2
+    fi
+done
+installed=$home/.local/state/harborplay/fex-eac/installed.json
+[ -f "$installed" ] && [ ! -L "$installed" ] && grep -q '/\.local/state/steamac/' "$installed" \
+    && setpriv --reuid "$(stat -c %u "$installed")" --regid "$(stat -c %g "$installed")" --clear-groups -- sed -i 's#/\.local/state/steamac/#/.local/state/harborplay/#g' "$installed"
+exit 0

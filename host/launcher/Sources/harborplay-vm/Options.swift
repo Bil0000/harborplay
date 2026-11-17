@@ -1,0 +1,880 @@
+import Foundation
+
+struct DiskSpec {
+    var path: String
+    var readOnly: Bool
+}
+
+enum MouseMode: String {
+    /// Default. The host pointer drives the guest cursor 1:1 through the relative mouse
+    /// (gamescope ignores absolute pointer motion; Desktop Mode's Plasma runs inside it too); while
+    /// a game is focused in the guest and the window is active, the pointer is captured (raw
+    /// relative motion for mouse-look); another window or Ctrl+Option releases.
+    case auto
+    /// Absolute virtio tablet, for a guest compositor that accepts absolute pointers (gamescope,
+    /// and so both SteamOS modes, does not).
+    case tablet
+    /// Always click-to-capture (relative mouse only).
+    case capture
+}
+
+struct Options {
+    var kernel: String = ""
+    var initrd: String?
+    /// virtio_snd.msg_timeout_ms: the CoreAudio backend starts a capture stream synchronously on the
+    /// control queue; opening the Mac microphone can take longer than the guest driver's 1 s default,
+    /// the guest then abandons PCM_START, PipeWire is killed by systemd and games freeze.
+    var cmdline = "console=hvc0 loglevel=4 rootwait virtio_snd.msg_timeout_ms=10000"
+    var disks: [DiskSpec] = []
+    /// --share DIR / Settings > Advanced "Shared folder": a Mac folder exposed to the guest as the
+    /// virtio-fs device tagged `Options.shareTag` (VM.init). nil = no share.
+    var share: String?
+    static let shareTag = "macshare"
+    /// --share-mount PATH / Settings > Advanced "Mount point in SteamOS": where the guest mounts the share
+    /// (kernel cmdline harborplay.share=PATH; the initramfs creates a runtime mount unit for it).
+    var shareMount = Options.defaultShareMount
+    /// Register SteamLibrary inside the share once per guest path (`harborplay.share_library=1`).
+    var shareLibrary = true
+    static let defaultShareMount = "/home/steamos/MacShare"
+    static func isReadableFolder(_ path: String) -> Bool {
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
+            && FileManager.default.isReadableFile(atPath: path)
+    }
+    /// A subdirectory of the writable home, never the home itself.
+    static let shareMountRoots = ["/home/steamos/"]
+    /// The same check as the initramfs ("shared folder" section): a subdirectory of
+    /// `shareMountRoots`, no empty, "." or ".." components, only [A-Za-z0-9/_.-].
+    static func isValidShareMount(_ p: String) -> Bool {
+        guard shareMountRoots.contains(where: { p.hasPrefix($0) && p.count > $0.count }),
+              !p.hasSuffix("/"),
+              p.unicodeScalars.allSatisfy({ $0.isASCII && (CharacterSet.alphanumerics.contains($0) || "/_.-".unicodeScalars.contains($0)) })
+        else { return false }
+        return !p.split(separator: "/", omittingEmptySubsequences: false).dropFirst().contains { $0.isEmpty || $0 == "." || $0 == ".." }
+    }
+
+    /// --selftest-settings: the validator agrees with the initramfs on what it accepts.
+    static func shareMountSelfCheck() -> [String] {
+        var failures: [String] = []
+        for good in ["/home/steamos/MacShare", "/home/steamos/Games/Mac-1", "/home/steamos/.cache"] where !isValidShareMount(good) {
+            failures.append("share mount: \(good) rejected")
+        }
+        for bad in ["", "/", "/home", "/home/steamos", "/home/steamos/", "/mnt", "/mnt/mac", "/media/mac", "/usr/mac", "/etc", "/home/steamos//x",
+                    "/home/steamos/../x", "/home/steamos/./x", "/home/steamos/My Games", "~/Games", "/home/steamos/x/",
+                    "/home/steamos/é", "/home/steamos/a:b", "/home/steamosx"] where isValidShareMount(bad) {
+            failures.append("share mount: \(bad) accepted")
+        }
+        log("selftest-settings: share mount: \(failures.isEmpty ? "ok" : "FAIL: \(failures.joined(separator: "; "))")")
+        return failures
+    }
+    /// Settings > Advanced, --cpus / --mem, else automatic for this Mac (VMSizing; applySettings).
+    var cpus = VMSizing.autoCPUs(.current)
+    var memMiB = VMSizing.autoMemMiB(.current)
+    var cpusSource = VMSizing.Source.auto
+    var memSource = VMSizing.Source.auto
+    /// --cmdline harborplay.gpu_mib=N overrides both renderer and guest reporting for tests.
+    var gpuBudgetMiB: Int {
+        let prefix = "harborplay.gpu_mib="
+        let word = cmdline.split(separator: " ").last { $0.hasPrefix(prefix) }
+        return word.flatMap { Int($0.dropFirst(prefix.count)) }
+            ?? VMSizing.gpuBudgetMiB(memMiB: memMiB, auto: memSource == .auto)
+    }
+    /// Initial window content size in points (`--display`, Settings > Display window size).
+    var displayWidth = 1280
+    var displayHeight = 800
+    /// Guest pixels per window point: the target screen's backing scale with Settings > Display >
+    /// Retina resolution, else 1 (fixed for the boot, like the EDID DPI).
+    var pixelScale = 1.0
+    /// Settings > Display "Render scale" / --render-scale: guest pixels per window pixel. 1 = off
+    /// (the guest renders at the window's pixel size). Below 1 the guest renders fewer pixels and
+    /// MetalFX super resolution upscales them back to the drawable (Renderer), which is cheap next
+    /// to the guest drawing them; fixed for the boot (it sizes the EDID mode, like `pixelScale`).
+    var renderScale = 1.0
+    /// Guest display size at boot: the window size times `pixelScale` and `renderScale`
+    /// (WindowController.guestSize).
+    var guestSize: (Int, Int) {
+        WindowController.guestSize(points: CGSize(width: displayWidth, height: displayHeight),
+                                   scale: pixelScale * renderScale)
+    }
+    var refreshRate = 60
+    /// Settings > Display > Refresh rate is Auto: the guest follows the window's screen at runtime.
+    var refreshFollowsScreen = false
+    var dpi: Int?
+    var displayMM: (Int, Int)?
+    var selftestOverlay = false
+    var selftestStall = false
+    var selftestPill = false
+    var selftestCursor = false
+    var selftestShortcuts = false
+    var headless = false
+    var logFile: String?
+    var network = true
+    var lanRemotePlay = false
+    var selftestRemotePlay = false
+    var selftestStream = false
+    var selftestPointer = false
+    var selftestGameLayers = false
+    var sound = true
+    var sshPort = 2222
+    /// Steam client of this boot (kernel cmdline `harborplay.steam_client=`).
+    var steamClient = LauncherSettings.SteamClient.deck
+    /// Settings > General "Use the Mac's time zone and clock format": MacTime kernel parameters.
+    var macTime = true
+    /// Host Vulkan driver of this boot (virglrenderer opens it; VM.start).
+    var vulkanDriver = LauncherSettings.VulkanDriver.moltenvk
+    /// Settings > Advanced "Frame latency" (kernel cmdline `harborplay.frame_latency=1`): the guest's
+    /// DXVK config gets dxgi.maxFrameLatency = 1 for the Vulkan path. Default false: unset.
+    var frameLatency = false
+    var experimentalGameSupport = true
+    /// --launch-app APPID: Steam starts this game once per boot (kernel cmdline harborplay.launch_app=).
+    var launchApp: Int?
+    var selftestGraphicsPath = false
+    /// Experimental wmtr context type: its executor library (HARBORPLAY_WMTR_LIB, set by VM.start
+    /// with HARBORPLAY_WMTR=1); nil = off.
+    var wmtrLibrary: String?
+    var shmMiB = 8192
+    var gpuFlags: UInt32? = nil
+    var gvproxyPath: String?
+    var frameDumpPath = "harborplay-frame.png"
+    var mouseMode: MouseMode = .auto
+    var controlFifo: String?
+    var autoCapture: Bool?
+    /// The guest gets gamepads over harbor.pad, harbor.pad2, … (`--no-gamepad`: no ports, no pads this run).
+    var gamepad = true
+    /// `--pad`: what the guest's gamepad is this run (instead of Settings > Controller).
+    var padType: LauncherSettings.PadType?
+    /// virglrenderer routes its INFO messages through libkrun at warn level, hundreds per second during
+    /// games (e.g. "host memory import is unsupported for memory type 0"), each a formatted write to the
+    /// launcher log: 1 (error) instead of 2 (warn).
+    var krunLogLevel: UInt32 = 1
+    var selftestDisplay = false
+    var selftestOut: String?
+    var inputSelftestDelay: Double?
+    var resizeSelftestDelay: Double?
+    var selftestSettings = false
+    var perfStats = false
+    /// Settings: enter fullscreen once the window is up.
+    var fullscreen = false
+    /// No main disk configured or found (app bundle launch): the first-run sheet asks for one.
+    var needsDisk = false
+    /// This boot attaches the first-boot provisioning payload (Provision.attachPending).
+    var provisionPayload: String?
+    /// This boot attaches the disk's pending generated guest password (Provision.attachConfig).
+    var configPayload: Provision.ConfigPayload?
+    /// --create-disk PATH (no VM): build a new SteamOS disk without Docker (DiskCreator).
+    var createDisk: String?
+    /// --grow-disk PATH --home-gib N (no VM): enlarge an existing disk, never shrink.
+    var growDisk: String?
+    var createBranch: String?
+    var createHomeGiB = DiskLayout.defaultHomeGiB
+    var createPassword: String?
+    var keepCache = false
+    /// --accept-eula: accept Valve's SteamOS EULA + Steam Subscriber Agreement (SteamOSLicense).
+    var acceptLicense = false
+    var selftestProvision = false
+    var selftestMetalCache = false
+    var selftestL10n = false
+    var referenceDisk: String?
+    /// --ssh-password DISK: print the disk's generated guest password (GuestPassword) and exit.
+    var showSSHPassword: String?
+    /// --no-crash-reports / HARBORPLAY_SENTRY=0: no Sentry for this run (CrashReporting).
+    var noCrashReports = false
+    /// Hidden --sentry-test-event / --sentry-test-crash MODE (CrashReporting.runTests).
+    var sentryTestEvent = false
+    var sentryTestCrash: String?
+    /// Flags given on the command line (they override the saved settings for this run).
+    var explicit: Set<String> = []
+
+    static let usage = """
+    usage: harborplay-vm --kernel PATH [--initrd PATH] [--cmdline STR] --disk PATH[:ro] ... [--share DIR [--share-mount PATH] | --no-share]
+                      [--share-library | --no-share-library]
+                      [--cpus N] [--mem MiB] [--display WxH] [--refresh HZ] [--headless]
+                      [--log FILE] [--no-net] [--no-sound] [--ssh-port PORT | --no-ssh] [--shm-mib MiB]
+                      [--gpu-flags HEX] [--gvproxy PATH] [--frame-dump PNG]
+                      [--mouse auto|tablet|capture] [--no-gamepad] [--pad auto|xbox360|dualsense|dualshock4|steamcontroller]
+                      [--krun-log-level 0-5] [--perf-stats]
+                      [--no-crash-reports] [--steam-client frame|deck|deckbeta]
+                      [--vulkan-driver moltenvk|kosmickrisp] [--lan-remote-play | --no-lan-remote-play]
+                      [--wmtr-lib PATH | --no-wmtr] [--frame-latency | --no-frame-latency]
+                      [--experimental-game-support | --no-experimental-game-support]
+           harborplay-vm --selftest-display [--headless] [--selftest-out DIR] [--display WxH]
+           harborplay-vm --selftest-overlay [--selftest-out DIR] [--display WxH]
+           harborplay-vm --selftest-stall [--selftest-out DIR] [--display WxH]
+           harborplay-vm --selftest-pill [--selftest-out DIR] [--display WxH]
+           harborplay-vm --selftest-settings [--selftest-out DIR]
+           harborplay-vm --selftest-provision [--reference-disk IMG]
+           harborplay-vm --selftest-remote-play
+           harborplay-vm --selftest-stream
+           harborplay-vm --selftest-metal-cache
+           harborplay-vm --selftest-pointer
+           harborplay-vm --selftest-game-layers
+           harborplay-vm --selftest-l10n
+           harborplay-vm --selftest-graphics-path [--wmtr-lib PATH | --no-wmtr]
+           harborplay-vm --create-disk PATH [--branch stable|rc] [--home-gib N]
+                      [--password PW] [--keep-cache] [--accept-eula]
+           harborplay-vm --ssh-password DISK
+
+    Without a flag, next-start values come from the Settings window (defaults domain io.github.bil0000.harborplay):
+    vCPUs, RAM, SSH port, network, sound, virtual pad, refresh, window size, physical size (DPI),
+    fullscreen, perf stats, Steam client, Vulkan driver, Mac time zone and 12/24-hour format
+    (Settings > General: adds harborplay.tz= and harborplay.clock24= unless --cmdline sets them).
+    Inside HarborPlay.app, --kernel/--initrd/--disk default to the bundled Image, initramfs and
+    layer plus the disk image chosen in Settings > Advanced.
+
+      --kernel PATH        raw arm64 Image (KRUN_KERNEL_FORMAT_RAW)
+      --initrd PATH        initramfs
+      --cmdline STR        kernel command line (default: "console=hvc0 loglevel=4 rootwait
+                           virtio_snd.msg_timeout_ms=10000"; fsck.repair=yes, harborplay.ssh/steam_client/tz
+                           are added unless STR sets them)
+      --disk PATH[:ro]     raw virtio-blk disk; repeatable, order = vda, vdb, ...
+      --share DIR          expose the Mac folder DIR to SteamOS as the virtio-fs device tagged "macshare"
+                           (default: Settings > Advanced "Shared folder", none unless chosen). virtio-fs does
+                           not confine the guest to DIR: root in SteamOS may reach what this Mac user can read
+      --share-mount PATH   where SteamOS mounts the shared folder (default: Settings > Advanced "Mount point in
+                           SteamOS", /home/steamos/MacShare): a subdirectory of /home/steamos/;
+                           kernel cmdline harborplay.share=PATH, the initramfs creates a mount unit for it on every boot
+      --no-share           no shared folder this run
+      --share-library      create SteamLibrary in the shared folder on next start and register it in Steam
+                           once per path (default: Settings > Advanced "Use as a Steam library", on).
+                           Proton requires symbolic links: APFS recommended, exFAT unsupported;
+                           automatic registration skips shares without symbolic link support
+      --no-share-library   do not create or register a shared Steam library this run
+      --cpus N             vCPUs (default: Settings > Advanced, automatic = this Mac's performance
+                           cores, 2..8)
+      --mem MiB            guest RAM (default: Settings > Advanced, automatic = half this Mac's RAM,
+                           4096..16384; the GPU's memory comes from the same RAM)
+      --display WxH        initial window size in points (default 1280x800); the guest display follows
+                           the window: content size in points = guest pixels, x the screen's backing
+                           scale with Settings > Display > Retina resolution (even, min 800x500, max
+                           4094), applied when a resize / fullscreen switch ends
+      --render-scale S     guest render scale 0.25..1.0 of the window's pixel size (default 1 = off,
+                           Settings > Display "Render scale"): the guest renders fewer pixels and
+                           MetalFX super resolution upscales them to the window; next start
+      --refresh HZ         EDID refresh rate (default: Settings > Display, Auto = the screen's)
+      --dpi N              EDID pixel density instead of the default physical size (below)
+      --display-mm WxH     EDID physical size in millimetres at the initial size (overrides --dpi)
+                           Default: the window's real size on the host monitor (initial content size
+                           in points x the screen's mm/point), so guest UIs come out at real-world size;
+                           96 dpi-equivalent when headless or the monitor reports no size. Resizes keep
+                           this DPI (physical size = new size x the same mm per pixel).
+      --headless           no window and no input devices; SIGUSR1 dumps the latest frame
+      --log FILE           also append the hvc0 console to FILE
+      -AppleLanguages '(L)' UI language for this run: en, ru or zh-Hans (default: the macOS language)
+      --no-net             no virtio-net / gvproxy
+      --lan-remote-play    expose Steam Remote Play on the LAN (Settings > Advanced; off by default)
+      --no-lan-remote-play disable the LAN discovery relay and Remote Play forwards for this boot
+      --no-sound           no virtio-snd (default: guest audio plays on the Mac's default output
+                           device and follows it when it changes; guest recording uses the default
+                           input device, asking for microphone permission the first time)
+      --ssh-port PORT      SSH on: host 127.0.0.1:PORT -> guest 192.168.127.2:22 (default 2222)
+      --no-ssh             SSH off: no port forward, guest sshd masked (kernel cmdline harborplay.ssh=0/1
+                           is added on every boot; the default comes from Settings > Advanced "Enable
+                           SSH": on for this dev launcher, off in the release .app)
+      --shm-mib MiB        virtio-gpu host-visible shared memory window (default 8192)
+      --gpu-flags HEX      virglrenderer flags (default VENUS|NO_VIRGL = 0xc0)
+      --gvproxy PATH       gvproxy binary (default: <exe dir>/host/bin/gvproxy, Homebrew, PATH)
+      --frame-dump PNG     where SIGUSR1 writes the current frame (default ./harborplay-frame.png)
+      --mouse MODE         auto (default): pointer follows the host cursor 1:1 (also in Desktop Mode);
+                           while a game has focus and the window is active the mouse is captured
+                           (relative, for mouse-look); another window or Ctrl+Option releases.
+                           tablet: absolute virtio tablet (ignored by gamescope, so only for other
+                           guest compositors). capture: always click-to-capture.
+      --auto-capture on|off  auto mode: capture the mouse in games, for this run (default: the saved
+                           setting, menu Mouse > Auto-Capture Mouse in Games; per-game overrides apply)
+      --no-gamepad         no virtual gamepad this run (default: Settings > Controller "Virtual
+                           controller", which applies while the VM runs)
+      --pad TYPE           what the virtual gamepad is in SteamOS this run (default: Settings >
+                           Controller): auto: the same kind as the controller that drives it
+                           (DualSense, DualShock 4, else Xbox 360), with a Steam Controller passed
+                           through as itself; steamcontroller: a Steam Controller goes to SteamOS
+                           as itself, any other controller drives an
+                           Xbox 360 pad; xbox360: Microsoft X-Box 360 pad (xpad); dualsense,
+                           dualshock4: Sony pad as the Linux hid-playstation / hid-sony drivers
+                           expose it (PlayStation button glyphs in Steam). Any connected
+                           controller drives it; its rumble plays on that controller.
+                           Further controllers are players 2-4 with a pad each (auto: of
+                           its own controller's kind; Settings > Controller "Additional
+                           controllers").
+      --krun-log-level N   libkrun log level 0=off .. 5=trace (default 1=error)
+      --steam-client C     Steam client SteamOS starts (kernel cmdline harborplay.steam_client=C, added on
+                           every boot; default: Settings > Advanced "Steam client", deck unless changed):
+                           deck: public ARM64 Steam Deck client (steamdeck_stable);
+                           deckbeta: Steam Deck client beta (steamdeck_publicbeta);
+                           frame: Valve's Steam Frame client beta (stock; until an account is remembered
+                           the Steam Deck client is used for its on-screen sign-in QR code).
+                           Switching downloads the other client (~1 GB) when Steam starts.
+      --vulkan-driver D    host Vulkan driver behind Venus (default: Settings > Advanced "Vulkan driver",
+                           KosmicKrisp where available, else MoltenVK):
+                           kosmickrisp: Mesa's KosmicKrisp on Metal 4 (macOS 26 or newer, builds that
+                           include it: host/kosmickrisp);
+                           moltenvk: MoltenVK with HarborPlay's patches (every Mac).
+                           Switching makes Steam and games rebuild their shader caches.
+      --wmtr-lib PATH      experimental: offer the guest the wmtr virtio-gpu context type (capset 30), DXMT's
+                           winemetal calls run on this Mac's Metal by the executor library PATH
+                           (default: Settings > Advanced "Allow DXMT", off unless changed)
+      --no-wmtr            the guest gets no wmtr context type for this run
+      --frame-latency      frame latency mode on (kernel cmdline harborplay.frame_latency=1; default:
+                           Settings > Advanced "Frame latency", off): the guest's DXVK config gets
+                           dxgi.maxFrameLatency = 1 (Vulkan path only), trading some throughput for
+                           lower input latency. Off means no key is added, so the guest side is
+                           unchanged. --no-frame-latency turns it off for this run.
+      --experimental-game-support  experimental game support on (kernel cmdline harborplay.fex_eac=1|0,
+                           added on every boot; default: Settings > Advanced "Experimental game
+                           support", on): sets up a Linux game runtime once an anti-cheat game is installed;
+                           restart Steam when setup finishes. Game support varies.
+                           --no-experimental-game-support turns it off for this run.
+      --launch-app APPID   Steam starts this game once Steam is up, once per boot (kernel cmdline
+                           harborplay.launch_app=); for game launchers
+
+    Creating a SteamOS disk (no Docker; the same code as Settings > Advanced "Create New Disk…"):
+      --create-disk PATH   download the signed SteamOS bundle of the branch (default: the saved setting,
+                           else stable), verify it against Valve's CA, rebuild the rootfs with desync
+                           (resumable; cache in ~/Library/Caches/io.github.bil0000.harborplay when PATH is on the home
+                           volume, else in PATH.cache), write a sparse GPT disk to PATH (never
+                           overwritten) plus PATH's .provision.img payload, which the first boot uses to
+                           format and fill the remaining partitions. One creation per cache at a time.
+      --home-gib N         size of the home partition (default 128; sparse)
+      --password PW        password of the guest user steamos (default: steamos for this dev launcher,
+                           none in the release .app; "" = none)
+      --keep-cache         keep the bundle and chunk cache after success
+      --accept-eula        accept Valve's End User License Agreement for SteamOS and Steam Client Back-Up
+                           Image (https://store.steampowered.com/steamos/download/?ver=steamframe) and the
+                           Steam Subscriber Agreement; required unless they were already accepted (Create
+                           SteamOS Disk window or an earlier --accept-eula), remembered afterwards
+      --grow-disk PATH     grow an existing disk's home capacity to --home-gib N (grow only).
+                           SteamOS must be stopped; partition and filesystem grow on its next boot.
+
+    SSH: --ssh-password DISK prints user, generated password and state (pending / applied) of DISK
+    (the password Settings > Advanced shows; it exists once SSH was enabled for that disk).
+
+    Crash reports (Settings > General "Send crash reports and diagnostics", on by default):
+      --no-crash-reports   no crash reports or diagnostics for this run (also HARBORPLAY_SENTRY=0);
+                           HARBORPLAY_SENTRY_DEBUG=1 prints the Sentry SDK's debug log
+
+    Updates (Settings > General "Check for updates at startup", on; never in the dev launcher
+    work/out/harborplay-vm): the first boot asks api.github.com for the latest Bil0000/harborplay release, at
+    most every 6 h; menu HarborPlay > Check for Updates… checks at any time. Test hooks:
+    HARBORPLAY_UPDATE_URL (release JSON, http(s):// or file://; also enables the dev launcher's startup
+    check), HARBORPLAY_FAKE_VERSION (the version this launcher compares as)
+
+    Diagnostics:
+      --perf-stats         every 5 s log frame pacing (also HARBORPLAY_PERF_STATS=1): guest flush and
+                           on-screen frame intervals (p50/p95/p99/max, count > 25 / > 50 ms), libkrun's
+                           per-flush copy, flush -> screen latency, dropped/replaced frames, upload time
+                           (HARBORPLAY_PERF_FRAMES=<path> also appends one CSV line per shown frame)
+      --selftest-display   feed synthetic frames (all formats) through the display backend vtable and
+                           verify PNG dump, Metal render and (windowed) the presented drawable
+      --input-selftest S   S seconds after boot, inject synthetic key/mouse/gamepad input, then
+                           close the window (guest power key) 4 s later
+      --selftest-overlay   drive the HarborPlay boot/shutdown overlay with synthetic console and harbor.progress
+                           input and write window captures at several progress points
+      --selftest-stall     drive the GPU-idle indicator with synthetic GPU counters and heartbeats
+                           and write window captures (indicator shown / hidden / not responding)
+      --selftest-pill      boot overlay vs progress pill (click / key / menu collapse, download stages keep
+                           or re-expand the overlay, live download progress, window title, fade at
+                           ready), then the no-picture guard with synthetic scanout states; captures + checks
+      --selftest-settings  open the Settings window and write a PNG of every tab to --selftest-out
+      --selftest-provision unit tests of the disk creator: GPT writer vs the layout of --reference-disk
+                           (default work/out/steamos.img, opened read-only), squashfs + CMS verification of
+                           the cached bundle, cpio payload, SHA-512 crypt, desync progress parsing
+      --selftest-metal-cache reproduce an inaccessible Metal module cache and verify startup recovery
+      --selftest-l10n      the bundle's ru and zh-Hans tables: present, the same keys, the same format
+                           arguments, the launcher's settings strings translated
+      --selftest-pointer   host pointer -> guest cursor mapping (Retina on/off, window vs scanout size,
+                           full-screen letterbox, MetalFX, the guest's focused surface from focus lines)
+      --selftest-game-layers verify game layer visibility and the Metal HUD's game/picture policy
+      --resize-selftest S  S seconds after Steam is ready, resize the window 1600x1000 -> fullscreen ->
+                           windowed -> 1280x800, wait for the guest's new scanout each time and dump
+                           frames to <--frame-dump>-resize-N-*.png
+      --control-fifo PATH  create a FIFO that accepts scripted window input, one command per line:
+                           move UX UY (0..1 in the picture) | button left|right|middle down|up |
+                           click left|right|middle | wheel NOTCHES | rel DX DY |
+                           key KEYCODE [ctrl+cmd+opt+shift] (macOS virtual key code) |
+                           grab | release | menu game|global (toggle the Mouse menu checkboxes) |
+                           guest LINE (as if sent on harbor.progress) | dump PNG (+ -window, -overlay,
+                           -screen = as composited on screen, Metal HUD included) |
+                           settings TAB|close | settings-dump PNG | set KEY VALUE | restart |
+                           update check|startup|state | update press download|skip|later|ok |
+                           update dump PNG (+ -with-vm = beside the VM window, as on screen) |
+                           stats state|flush|ask|reset-question | stats press share|decline |
+                           stats dump PNG (game statistics question window)
+
+    Window keys follow the Mac menu bindings. See the View and Mouse menus.
+    Ctrl+Option releases the mouse.
+    Closing the window (or SIGINT/SIGTERM) presses the guest power key; a second request force-quits.
+    Console: hvc0 <-> this terminal (raw mode when stdin is a TTY; Ctrl+] twice force-quits).
+    """
+
+    static func parse(_ argv: [String]) throws -> Options {
+        var o = Options()
+        var i = 1
+        func value(_ name: String) throws -> String {
+            i += 1
+            guard i < argv.count else { throw OptionError("\(name) needs a value") }
+            return argv[i]
+        }
+        func int(_ name: String) throws -> Int {
+            let v = try value(name)
+            guard let n = Int(v) else { throw OptionError("\(name): not an integer: \(v)") }
+            return n
+        }
+        while i < argv.count {
+            let a = argv[i]
+            if a.hasPrefix("-psn_") { i += 1; continue }   // old Finder process serial number
+            // Cocoa argument-domain overrides of the UI language (NSUserDefaults reads them itself).
+            if a == "-AppleLanguages" || a == "-AppleLocale" { i += 2; continue }
+            o.explicit.insert(a)
+            switch a {
+            case "--kernel": o.kernel = try value(a)
+            case "--initrd": o.initrd = try value(a)
+            case "--cmdline": o.cmdline = try value(a)
+            case "--disk":
+                var p = try value(a)
+                var ro = false
+                if p.hasSuffix(":ro") { ro = true; p.removeLast(3) }
+                else if p.hasSuffix(":rw") { p.removeLast(3) }
+                o.disks.append(DiskSpec(path: p, readOnly: ro))
+            case "--share": o.share = try value(a)
+            case "--no-share": o.share = nil
+            case "--share-mount": o.shareMount = try value(a)
+            case "--share-library": o.shareLibrary = true
+            case "--no-share-library": o.shareLibrary = false
+            case "--cpus": o.cpus = try int(a)
+            case "--mem": o.memMiB = try int(a)
+            case "--display":
+                let v = try value(a)
+                let parts = v.lowercased().split(separator: "x").compactMap { Int($0) }
+                guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { throw OptionError("--display: expected WxH, got \(v)") }
+                o.displayWidth = parts[0]; o.displayHeight = parts[1]
+            case "--render-scale":
+                let v = try value(a)
+                guard let s = Double(v), (0.25...1.0).contains(s) else {
+                    throw OptionError("--render-scale must be 0.25..1.0")
+                }
+                o.renderScale = s
+            case "--refresh": o.refreshRate = try int(a)
+            case "--dpi":
+                let d = try int(a)
+                guard (50...600).contains(d) else { throw OptionError("--dpi must be 50..600") }
+                o.dpi = d
+            case "--display-mm":
+                let v = try value(a)
+                let parts = v.lowercased().split(separator: "x").compactMap { Int($0) }
+                guard parts.count == 2, (10...5000).contains(parts[0]), (10...5000).contains(parts[1]) else {
+                    throw OptionError("--display-mm: expected WxH in millimetres, got \(v)")
+                }
+                o.displayMM = (parts[0], parts[1])
+            case "--headless": o.headless = true
+            case "--log": o.logFile = try value(a)
+            case "--no-net": o.network = false
+            case "--lan-remote-play": o.lanRemotePlay = true
+            case "--no-lan-remote-play": o.lanRemotePlay = false
+            case "--no-sound": o.sound = false
+            case "--ssh-port": o.sshPort = try int(a)
+            case "--no-ssh": o.sshPort = 0
+            case "--steam-client":
+                let v = try value(a)
+                guard let c = LauncherSettings.SteamClient(rawValue: v) else {
+                    throw OptionError("--steam-client: frame, deck or deckbeta")
+                }
+                o.steamClient = c
+            case "--selftest-graphics-path": o.selftestGraphicsPath = true
+            case "--selftest-cursor": o.selftestCursor = true
+            case "--selftest-shortcuts": o.selftestShortcuts = true
+            case "--frame-latency": o.frameLatency = true
+            case "--no-frame-latency": o.frameLatency = false
+            case "--experimental-game-support": o.experimentalGameSupport = true
+            case "--no-experimental-game-support": o.experimentalGameSupport = false
+            case "--launch-app":
+                let n = try int(a)
+                guard n > 0 else { throw OptionError("--launch-app: a Steam app id") }
+                o.launchApp = n
+            case "--vulkan-driver":
+                let v = try value(a)
+                guard let d = LauncherSettings.VulkanDriver(rawValue: v) else {
+                    throw OptionError("--vulkan-driver: moltenvk or kosmickrisp")
+                }
+                o.vulkanDriver = d
+            case "--wmtr-lib": o.wmtrLibrary = try value(a)
+            case "--no-wmtr": o.wmtrLibrary = nil
+            case "--shm-mib": o.shmMiB = try int(a)
+            case "--gpu-flags":
+                let v = try value(a)
+                let s = v.hasPrefix("0x") ? String(v.dropFirst(2)) : v
+                guard let f = UInt32(s, radix: 16) else { throw OptionError("--gpu-flags: not hex: \(v)") }
+                o.gpuFlags = f
+            case "--gvproxy": o.gvproxyPath = try value(a)
+            case "--frame-dump": o.frameDumpPath = try value(a)
+            case "--mouse":
+                let v = try value(a)
+                guard let m = MouseMode(rawValue: v) else { throw OptionError("--mouse: auto, tablet or capture") }
+                o.mouseMode = m
+            case "--control-fifo": o.controlFifo = try value(a)
+            case "--auto-capture":
+                let v = try value(a)
+                guard v == "on" || v == "off" else { throw OptionError("--auto-capture: on or off") }
+                o.autoCapture = v == "on"
+            case "--no-gamepad": o.gamepad = false
+            case "--pad":
+                let v = try value(a)
+                guard let t = LauncherSettings.PadType(rawValue: v) else {
+                    throw OptionError("--pad: auto, xbox360, dualsense, dualshock4 or steamcontroller")
+                }
+                o.padType = t
+            case "--krun-log-level": o.krunLogLevel = UInt32(clamping: try int(a))
+            case "--perf-stats": o.perfStats = true
+            case "--no-crash-reports": o.noCrashReports = true
+            case "--sentry-test-event": o.sentryTestEvent = true
+            case "--sentry-test-crash":
+                let v = try value(a)
+                guard ["abort", "segv", "metal", "panic", "kill", "term", "shader", "gpu-teardown"].contains(v) else {
+                    throw OptionError("--sentry-test-crash: abort, segv, metal, panic, kill, term, shader or gpu-teardown")
+                }
+                o.sentryTestCrash = v
+            case "--selftest-display": o.selftestDisplay = true
+            case "--selftest-out": o.selftestOut = try value(a)
+            case "--selftest-overlay": o.selftestOverlay = true
+            case "--selftest-stall": o.selftestStall = true
+            case "--selftest-pill": o.selftestPill = true
+            case "--selftest-settings": o.selftestSettings = true
+            case "--selftest-remote-play": o.selftestRemotePlay = true
+            case "--selftest-stream": o.selftestStream = true
+            case "--selftest-provision": o.selftestProvision = true
+            case "--selftest-metal-cache": o.selftestMetalCache = true
+            case "--selftest-pointer": o.selftestPointer = true
+            case "--selftest-game-layers": o.selftestGameLayers = true
+            case "--selftest-l10n": o.selftestL10n = true
+            case "--reference-disk": o.referenceDisk = try value(a)
+            case "--create-disk": o.createDisk = try value(a)
+            case "--grow-disk": o.growDisk = try value(a)
+            case "--branch":
+                let v = try value(a)
+                guard DiskCreator.branches.contains(v) else { throw OptionError("--branch: stable or rc") }
+                o.createBranch = v
+            case "--home-gib": o.createHomeGiB = try int(a)
+            case "--password": o.createPassword = try value(a)
+            case "--keep-cache": o.keepCache = true
+            case "--accept-eula": o.acceptLicense = true
+            case "--ssh-password": o.showSSHPassword = try value(a)
+            case "--resize-selftest":
+                let v = try value(a)
+                guard let d = Double(v), d >= 0 else { throw OptionError("--resize-selftest: seconds") }
+                o.resizeSelftestDelay = d
+            case "--input-selftest":
+                let v = try value(a)
+                guard let d = Double(v), d >= 0 else { throw OptionError("--input-selftest: seconds") }
+                o.inputSelftestDelay = d
+            case "-h", "--help":
+                print(usage)
+                exit(0)
+            default:
+                throw OptionError("unknown argument: \(a)")
+            }
+            i += 1
+        }
+        if ProcessInfo.processInfo.environment["HARBORPLAY_PERF_STATS"] == "1" {
+            o.perfStats = true
+            o.explicit.insert("HARBORPLAY_PERF_STATS=1")
+        }
+        if let p = ProcessInfo.processInfo.environment["HARBORPLAY_PERF_FRAMES"], !p.isEmpty {
+            o.perfStats = true
+            o.explicit.insert("HARBORPLAY_PERF_FRAMES")
+        }
+        if ProcessInfo.processInfo.environment[CrashReporting.disableEnv] == "0" {
+            o.noCrashReports = true
+            o.explicit.insert("\(CrashReporting.disableEnv)=0")
+        }
+        return o
+    }
+
+    /// Settings > Advanced "Frame latency" -> kernel cmdline key: on writes `harborplay.frame_latency=1`,
+    /// off writes nothing (absent is the default). The key is `harborplay.frame_latency`.
+    static func frameLatencyArg(_ on: Bool) -> (key: String, value: String)? {
+        on ? ("harborplay.frame_latency", "1") : nil
+    }
+
+    static func experimentalGameSupportArg(_ on: Bool) -> (key: String, value: String) {
+        ("harborplay.fex_eac", on ? "1" : "0")
+    }
+
+    static func kernelArg(_ key: String, _ value: @autoclosure () -> String?, unlessSetIn cmdline: String) -> String {
+        guard !cmdline.split(separator: " ").contains(where: { $0.hasPrefix(key + "=") }), let v = value() else { return "" }
+        return " \(key)=\(v)"
+    }
+
+    var isSelftest: Bool {
+        selftestDisplay || selftestOverlay || selftestStall || selftestPill || selftestSettings || selftestProvision || selftestRemotePlay
+            || selftestMetalCache || selftestPointer || selftestGameLayers || selftestStream || selftestL10n || selftestCursor || selftestShortcuts
+            || createDisk != nil || growDisk != nil
+            || showSSHPassword != nil
+    }
+
+    /// Command line + saved settings (+ app bundle resources): what this boot runs with, and which
+    /// settings keys the command line overrides.
+    static func resolve(_ argv: [String], settings: LauncherSettings) throws -> (Options, [LauncherSettings.Key: String]) {
+        var o = try parse(argv)
+        var overrides = o.applySettings(settings)
+        if !o.isSelftest, let reason = o.vulkanDriver.unavailableReason {
+            guard !o.explicit.contains("--vulkan-driver") else {
+                throw OptionError("--vulkan-driver \(o.vulkanDriver.rawValue): \(o.vulkanDriver.name) \(reason)")
+            }
+            log("gpu: \(o.vulkanDriver.name) \(reason); using MoltenVK")
+            o.vulkanDriver = .moltenvk
+        }
+        if !o.isSelftest, let lib = o.wmtrLibrary, let reason = LauncherSettings.Wmtr.unavailableReason(lib) {
+            guard !o.explicit.contains("--wmtr-lib") else { throw OptionError("--wmtr-lib: \(reason)") }
+            log("gpu: wmtr: \(reason); the guest gets no wmtr context type")
+            o.wmtrLibrary = nil
+        }
+        if !o.isSelftest {
+            AppBundle.fill(&o, settings: settings, overrides: &overrides)
+            Provision.attachPending(&o)
+            Provision.attachConfig(&o)
+            let given = o.cmdline
+            func add(_ key: String, _ value: @autoclosure () -> String?) { o.cmdline += Options.kernelArg(key, value(), unlessSetIn: given) }
+            add("harborplay.ssh", o.sshPort == 0 ? "0" : "1")
+            add("harborplay.steam_client", o.steamClient.rawValue)
+            add("harborplay.gfx", o.wmtrLibrary == nil ? "vulkan" : "dxmt")
+            add("harborplay.gpu_mib", String(VMSizing.gpuBudgetMiB(memMiB: o.memMiB, auto: o.memSource == .auto)))
+            add("harborplay.share", o.share == nil ? nil : o.shareMount)
+            add("harborplay.share_library", o.share != nil && o.shareLibrary ? "1" : nil)
+            // only written when on; absent is the default (off), so an explicit =0 needs no key
+            if let a = Options.frameLatencyArg(o.frameLatency) { add(a.key, a.value) }
+            let fex = Options.experimentalGameSupportArg(o.experimentalGameSupport)
+            add(fex.key, fex.value)
+            add("harborplay.launch_app", o.launchApp.map(String.init))
+            if o.macTime {
+                add("harborplay.tz", MacTime.zone)
+                add("harborplay.clock24", MacTime.clock24.map { $0 ? "1" : "0" })
+            }
+            // systemd-fsck answers yes to e2fsck's questions instead of only preening: a /home with errors
+            // preen cannot fix (a VM killed mid-write, two VMs on one disk) is repaired at boot instead of
+            // failing /home and every unit after it (boot stuck at "Starting SteamOS services").
+            add("fsck.repair", "yes")
+            // SteamOS swaps to zram; zswap in front of it only adds a second compression pass.
+            add("zswap.enabled", "0")
+            // Give page cache a game has not touched for 120 s back to the guest's free memory, which
+            // free page reporting returns to the Mac (assets read once at load otherwise stay resident
+            // for the whole session). wmarks_low=0: keep working when free memory is low, the normal
+            // state once a game has filled the cache. Capped at 10 ms of one vCPU per second.
+            add("damon_reclaim.enabled", "Y")
+            add("damon_reclaim.skip_anon", "Y")
+            add("damon_reclaim.wmarks_low", "0")
+            add("damon_reclaim.wmarks_mid", "250")
+            add("damon_reclaim.wmarks_high", "300")
+        }
+        try o.validate()
+        return (o, overrides)
+    }
+
+    /// Fill every value the command line did not set from the saved settings.
+    mutating func applySettings(_ s: LauncherSettings) -> [LauncherSettings.Key: String] {
+        var ov: [LauncherSettings.Key: String] = [:]
+        func given(_ flag: String) -> Bool { explicit.contains(flag) }
+        if given("--cpus") {
+            ov[.cpus] = "--cpus \(cpus)"
+            cpusSource = .flag
+        } else if s.cpus > 0 {
+            cpus = min(255, s.cpus)
+            cpusSource = .settings
+        } else {
+            cpus = VMSizing.autoCPUs(.current)
+            cpusSource = .auto
+        }
+        if given("--mem") {
+            ov[.memMiB] = "--mem \(memMiB)"
+            memSource = .flag
+        } else if s.memMiB > 0 {
+            memMiB = max(1024, s.memMiB)
+            memSource = .settings
+        } else {
+            memMiB = VMSizing.autoMemMiB(.current)
+            memSource = .auto
+        }
+        if given("--no-ssh") {
+            ov[.sshEnabled] = "--no-ssh"
+            ov[.sshPort] = "--no-ssh"
+        } else if given("--ssh-port") {
+            ov[.sshPort] = "--ssh-port \(sshPort)"
+            ov[.sshEnabled] = ov[.sshPort]
+        } else {
+            sshPort = !s.sshEnabled || s.sshPort == 0 ? 0 : (1024...65535).contains(s.sshPort) ? s.sshPort : 2222
+        }
+        if given("--no-net") { ov[.network] = "--no-net" } else { network = s.network }
+        if given("--lan-remote-play") || given("--no-lan-remote-play") {
+            ov[.lanRemotePlay] = lanRemotePlay ? "--lan-remote-play" : "--no-lan-remote-play"
+        } else { lanRemotePlay = s.lanRemotePlay }
+        macTime = s.followMacTime
+        if given("--steam-client") { ov[.steamClient] = "--steam-client \(steamClient.rawValue)" } else { steamClient = s.steamClient }
+        if given("--vulkan-driver") { ov[.vulkanDriver] = "--vulkan-driver \(vulkanDriver.rawValue)" } else { vulkanDriver = s.vulkanDriver }
+        if given("--wmtr-lib") || given("--no-wmtr") {
+            let flag = wmtrLibrary.map { "--wmtr-lib \($0)" } ?? "--no-wmtr"
+            ov[.wmtr] = flag
+            ov[.wmtrLibrary] = flag
+        } else {
+            wmtrLibrary = s.wmtr ? LauncherSettings.Wmtr.path(for: s.wmtrLibrary) : nil
+        }
+        if given("--frame-latency") || given("--no-frame-latency") {
+            ov[.frameLatency] = frameLatency ? "--frame-latency" : "--no-frame-latency"
+        } else { frameLatency = s.frameLatency }
+        if given("--experimental-game-support") || given("--no-experimental-game-support") {
+            ov[.experimentalGameSupport] = experimentalGameSupport ? "--experimental-game-support" : "--no-experimental-game-support"
+        } else { experimentalGameSupport = s.experimentalGameSupport }
+        if given("--no-sound") { ov[.soundEnabled] = "--no-sound" } else { sound = s.soundEnabled }
+        if given("--share") || given("--no-share") {
+            ov[.sharedFolder] = share.map { "--share \($0)" } ?? "--no-share"
+        } else {
+            // Like the DXMT library: a folder that is gone (external drive unplugged, renamed)
+            // must not stop the launcher; boot without the share and say so.
+            share = nil
+            if !s.sharedFolder.isEmpty {
+                if Options.isReadableFolder(s.sharedFolder) {
+                    share = s.sharedFolder
+                } else if !isSelftest {
+                    log("shared folder \(s.sharedFolder): not a readable folder; booting without the share")
+                }
+            }
+        }
+        if given("--share-mount") {
+            ov[.sharedMount] = "--share-mount \(shareMount)"
+        } else {
+            shareMount = Options.isValidShareMount(s.sharedMount) ? s.sharedMount : Options.defaultShareMount
+        }
+        if given("--share-library") || given("--no-share-library") {
+            ov[.sharedLibrary] = shareLibrary ? "--share-library" : "--no-share-library"
+        } else {
+            shareLibrary = s.sharedLibrary
+        }
+        if given("--no-gamepad") { ov[.virtualPad] = "--no-gamepad" }
+        if let padType { ov[.padType] = "--pad \(padType.rawValue)" }
+        if given("--refresh") { ov[.refreshRate] = "--refresh \(refreshRate)" }
+        else if s.refreshRate == LauncherSettings.autoRefresh {
+            refreshRate = headless ? 60 : LauncherSettings.screenRefreshRate()
+            refreshFollowsScreen = !headless
+        }
+        else { refreshRate = min(240, max(24, s.refreshRate)) }
+        if given("--display") {
+            ov[.windowWidth] = "--display \(displayWidth)x\(displayHeight)"
+            ov[.windowHeight] = ov[.windowWidth]
+            ov[.windowSizePreset] = ov[.windowWidth]
+        } else {
+            // "Fit to screen" is re-evaluated at every start (the screen may have changed).
+            let (w, h) = s.windowSizePreset == LauncherSettings.fitPreset && !headless
+                ? LauncherSettings.fitToScreenSize() : (s.windowWidth, s.windowHeight)
+            displayWidth = min(VM.maxDisplaySide & ~1, max(Int(WindowController.minGuestSize.width), w & ~1))
+            displayHeight = min(VM.maxDisplaySide & ~1, max(Int(WindowController.minGuestSize.height), h & ~1))
+        }
+        if s.retinaResolution && !headless {
+            pixelScale = max(1, WindowController.targetScreen()?.backingScaleFactor ?? 1)
+        }
+        if given("--render-scale") { ov[.renderScale] = "--render-scale \(renderScale)" }
+        else { renderScale = min(1, max(0.25, s.renderScale)) }
+        if given("--dpi") || given("--display-mm") {
+            let flag = displayMM.map { "--display-mm \($0.0)x\($0.1)" } ?? "--dpi \(dpi ?? 0)"
+            for k in [LauncherSettings.Key.dpiSource, .fixedDPI, .fixedWidthMM, .fixedHeightMM] { ov[k] = flag }
+        } else {
+            switch s.dpiSource {
+            case .auto: break
+            case .dpi: dpi = min(600, max(50, s.fixedDPI))
+            case .mm: displayMM = (min(5000, max(10, s.fixedWidthMM)), min(5000, max(10, s.fixedHeightMM)))
+            }
+        }
+        if perfStats { ov[.perfStats] = explicit.contains("--perf-stats") ? "--perf-stats" : "HARBORPLAY_PERF_STATS=1" }
+        else { perfStats = s.perfStats }
+        fullscreen = s.openFullscreen
+        if noCrashReports {
+            ov[.sendCrashReports] = explicit.contains(CrashReporting.noFlag) ? CrashReporting.noFlag : "\(CrashReporting.disableEnv)=0"
+        }
+        if !disks.isEmpty { ov[.diskImage] = "--disk \(disks[0].path)" }
+        return ov
+    }
+
+    func validate() throws {
+        guard !isSelftest, !sentryTestEvent, sentryTestCrash == nil else { return }
+        // Before the needsDisk return: a boot that shows the first-run disk window skipped every check, so
+        // --mem 0 or --cpus 0 booted a guest with no RAM or vCPU and hung.
+        guard memMiB >= VMSizing.minMemMiB else {
+            throw OptionError("--mem must be at least \(VMSizing.minMemMiB) MiB, got \(memMiB)")
+        }
+        guard (1...255).contains(cpus) else { throw OptionError("--cpus must be 1..255, got \(cpus)") }
+        guard !needsDisk else { return }
+        guard !kernel.isEmpty else { throw OptionError("--kernel is required") }
+        let gpuWords = cmdline.split(separator: " ").filter { $0.hasPrefix("harborplay.gpu_mib=") }
+        if !gpuWords.isEmpty {
+            guard gpuWords.count == 1, let value = Int(gpuWords[0].dropFirst("harborplay.gpu_mib=".count)),
+                  (256...16384).contains(value) else {
+                throw OptionError("harborplay.gpu_mib must occur once and be 256..16384 MiB")
+            }
+        }
+        guard sshPort == 0 || (1024...65535).contains(sshPort) else {
+            throw OptionError("--ssh-port must be 0 or 1024..65535")
+        }
+        for path in [kernel] + (initrd.map { [$0] } ?? []) + disks.map(\.path) {
+            guard FileManager.default.isReadableFile(atPath: path) else {
+                throw OptionError("not readable: \(path)")
+            }
+        }
+        if disks.count > 26 { throw OptionError("at most 26 disks") }
+        if let share {
+            guard Options.isReadableFolder(share) else { throw OptionError("--share: not a readable folder: \(share)") }
+            guard Options.isValidShareMount(shareMount) else {
+                throw OptionError("--share-mount: a subdirectory of \(Options.shareMountRoots.joined(separator: ", ")), no . or .. components, characters A-Z a-z 0-9 / _ . - only: \(shareMount)")
+            }
+        }
+    }
+}
+
+/// The Mac's time zone and 12/24-hour format, read at every VM start. The guest follows
+/// harborplay.tz= and harborplay.clock24= until the corresponding setting is changed in SteamOS.
+enum MacTime {
+    /// IANA identifier (e.g. Europe/Moscow); nil when it cannot be a kernel parameter.
+    static var zone: String? {
+        let id = TimeZone.current.identifier
+        return isZone(id) ? id : nil
+    }
+
+    /// The "j" template honors macOS's 24-hour override, unlike a locale's default format.
+    static var clock24: Bool? {
+        DateFormatter.dateFormat(fromTemplate: "j", options: 0, locale: .current).map(is24Hour)
+    }
+
+    static func is24Hour(_ pattern: String) -> Bool {
+        pattern.contains("H") || pattern.contains("k")
+    }
+
+    /// The same check as the initramfs: zoneinfo-relative path characters only.
+    static func isZone(_ s: String) -> Bool {
+        !s.isEmpty && !s.hasPrefix("/") && !s.contains("..")
+            && s.unicodeScalars.allSatisfy { $0.isASCII && (CharacterSet.alphanumerics.contains($0) || "_+-/".unicodeScalars.contains($0)) }
+    }
+
+    /// --selftest-settings: zone validation, clock patterns and this Mac's values.
+    static func selfCheck() -> [String] {
+        var failures: [String] = []
+        for good in ["Europe/Moscow", "America/Argentina/Buenos_Aires", "Etc/GMT+3", "UTC"] where !isZone(good) {
+            failures.append("mac time: \(good) rejected")
+        }
+        for bad in ["", "/etc/passwd", "Europe/../../x", "Europe/Moscow x", "Europe/Moskva\u{0301}"] where isZone(bad) {
+            failures.append("mac time: \(bad) accepted")
+        }
+        if zone == nil { failures.append("mac time: time zone \(TimeZone.current.identifier) is no kernel parameter") }
+        for pattern in ["H", "HH", "k", "kk"] where !is24Hour(pattern) {
+            failures.append("mac time: 24-hour pattern \(pattern) rejected")
+        }
+        for pattern in ["h a", "hh a", "K a"] where is24Hour(pattern) {
+            failures.append("mac time: 12-hour pattern \(pattern) accepted")
+        }
+        if clock24 == nil { failures.append("mac time: no localized hour pattern") }
+        log("selftest-settings: mac time: harborplay.tz=\(zone ?? "-") harborplay.clock24=\(clock24.map { $0 ? "1" : "0" } ?? "-")")
+        return failures
+    }
+}
+
+/// `description`: English, for the CLI, logs and crash reports ("\(error)"). `localizedDescription`:
+/// the UI text, `localized` when given (String(localized:)), else the English text.
+struct OptionError: LocalizedError, CustomStringConvertible {
+    let description: String
+    let localized: String?
+    init(_ d: String, localized: String? = nil) { description = d; self.localized = localized }
+    var errorDescription: String? { localized ?? description }
+}

@@ -1,0 +1,29 @@
+#!/bin/bash
+# harborplay: launcher --launch-app APPID (kernel command line harborplay.launch_app=APPID), used by
+# game launchers to start one game in HarborPlay: once Steam's UI is up (the harbor-progress-agent
+# `ready` marker of this boot), run steam://rungameid/APPID. At most once per boot, so a Steam
+# restart does not start the game again.
+# ExecStartPost of steam.service; returns at once. The wait runs in the background inside the
+# service, so a Steam stop or restart ends it and the next start waits again.
+# Test overrides: HARBORPLAY_CMDLINE, HARBORPLAY_READY_MARKER, HARBORPLAY_BOOT_ID, HARBORPLAY_STEAM.
+set -euo pipefail
+
+app=
+for w in $(cat "${HARBORPLAY_CMDLINE:-/proc/cmdline}" 2>/dev/null); do
+    case $w in harborplay.launch_app=*) app=${w#harborplay.launch_app=} ;; esac
+done
+[[ $app =~ ^[1-9][0-9]{0,9}$ ]] || exit 0
+
+done_marker=${XDG_RUNTIME_DIR:?}/harborplay/launch-app-done
+[[ -e $done_marker ]] && exit 0
+
+ready=${HARBORPLAY_READY_MARKER:-/tmp/.harbor-progress-ready-$(id -u)}
+boot=${HARBORPLAY_BOOT_ID:-$(cat /proc/sys/kernel/random/boot_id)}
+steam=${HARBORPLAY_STEAM:-/usr/bin/steam}
+(
+    until [[ $(cat "$ready" 2>/dev/null) == "$boot" ]]; do sleep 1; done
+    mkdir -p "${done_marker%/*}"
+    : > "$done_marker"
+    echo "harborplay: --launch-app: starting steam://rungameid/$app" >&2
+    exec "$steam" "steam://rungameid/$app"
+) </dev/null >/dev/null 2>&1 &

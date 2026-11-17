@@ -1,0 +1,10 @@
+# harborplay: once per boot, after the Steam client has started (its start reads most of the cache).
+[Unit]
+Description=HarborPlay: return boot page cache to the Mac (once, after boot)
+
+[Timer]
+OnBootSec=150s
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

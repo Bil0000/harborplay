@@ -1,0 +1,14 @@
+# harborplay: drop the boot's clean page cache once so free page reporting hands it back to the Mac
+# (see /usr/lib/harborplay/mem-trim; harborplay.mem_trim=0 turns it off). Started by its timer.
+[Unit]
+Description=HarborPlay: return boot page cache to the Mac
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/harborplay/mem-trim
+# 75 = a game is running: no drop now, run again 5 minutes later. Not a success status:
+# systemd never restarts a oneshot whose exit counts as success.
+RestartForceExitStatus=75
+RestartSec=300
+Nice=19
+IOSchedulingClass=idle
